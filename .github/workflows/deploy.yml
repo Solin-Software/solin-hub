@@ -1,0 +1,95 @@
+name: Deploy
+
+# Ships main to the hub VPS after CI passes. Inactive until the "production" environment is set up
+# (see INSTALL.md, "Continuous deployment"): without the HUB_HOST variable the deploy job is skipped.
+#
+# Environment "production":
+#   variables  HUB_HOST (required), HUB_SSH_USER (default solin-hub), HUB_SSH_PORT (default 22),
+#              HUB_DIR (default /opt/solin-hub), HUB_DOMAIN (optional: public health check)
+#   secrets    HUB_SSH_KEY          private key of the deploy user (ed25519, no passphrase)
+#              HUB_SSH_KNOWN_HOSTS  the VPS host key line(s): ssh-keyscan -t ed25519 <host>
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Restart the tunnel server / TURN relay even while halls are connected (cuts running meetings)
+        type: boolean
+        default: false
+      dry_run:
+        description: Validate and show the plan on the VPS without changing anything
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# One deploy at a time; a newer push waits instead of cancelling a deploy halfway.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    name: Deploy to the hub VPS
+    needs: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: production
+      url: ${{ vars.HUB_DOMAIN && format('https://{0}/', vars.HUB_DOMAIN) || '' }}
+    if: ${{ vars.HUB_HOST != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up SSH
+        env:
+          HUB_SSH_KEY: ${{ secrets.HUB_SSH_KEY }}
+          HUB_SSH_KNOWN_HOSTS: ${{ secrets.HUB_SSH_KNOWN_HOSTS }}
+        run: |
+          if [ -z "$HUB_SSH_KEY" ] || [ -z "$HUB_SSH_KNOWN_HOSTS" ]; then
+            echo "::error::Set the HUB_SSH_KEY and HUB_SSH_KNOWN_HOSTS secrets in the production environment."
+            exit 1
+          fi
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$HUB_SSH_KEY" > ~/.ssh/hub_deploy
+          printf '%s\n' "$HUB_SSH_KNOWN_HOSTS" > ~/.ssh/hub_known_hosts
+          chmod 600 ~/.ssh/hub_deploy ~/.ssh/hub_known_hosts
+
+      - name: Ship and apply
+        env:
+          HUB_HOST: ${{ vars.HUB_HOST }}
+          HUB_SSH_USER: ${{ vars.HUB_SSH_USER || 'solin-hub' }}
+          HUB_SSH_PORT: ${{ vars.HUB_SSH_PORT || '22' }}
+          HUB_DIR: ${{ vars.HUB_DIR || '/opt/solin-hub' }}
+          HUB_SSH_KEY_FILE: ~/.ssh/hub_deploy
+          HUB_KNOWN_HOSTS: ~/.ssh/hub_known_hosts
+          FORCE: ${{ inputs.force && '--force' || '' }}
+          DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
+        run: |
+          export HUB_SSH_KEY_FILE="${HUB_SSH_KEY_FILE/#\~/$HOME}" HUB_KNOWN_HOSTS="${HUB_KNOWN_HOSTS/#\~/$HOME}"
+          # shellcheck disable=SC2086 # empty flags must vanish
+          scripts/deploy.sh $FORCE $DRY_RUN
+
+      - name: Public health check
+        if: ${{ vars.HUB_DOMAIN != '' && !inputs.dry_run }}
+        env:
+          HUB_DOMAIN: ${{ vars.HUB_DOMAIN }}
+        run: |
+          for _ in $(seq 20); do
+            if [ "$(curl -fsS --max-time 5 "https://$HUB_DOMAIN/healthz")" = ok ]; then
+              echo "https://$HUB_DOMAIN/ is healthy"; exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::https://$HUB_DOMAIN/healthz did not answer ok"
+          exit 1
+
+      - name: Remove the SSH key
+        if: always()
+        run: rm -f ~/.ssh/hub_deploy

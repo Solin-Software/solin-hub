@@ -1,0 +1,67 @@
+name: CI
+
+# main is tested by the Deploy workflow, which runs this one before shipping.
+on:
+  push:
+    branches-ignore: [main]
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  checks:
+    name: Lint, unit tests, config validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Lint Python
+        run: pipx run ruff==0.15.16 check .
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Lint shell scripts
+        run: shellcheck --severity=warning scripts/*.sh coturn-entrypoint.sh
+
+      - name: Lint workflows
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
+          ./actionlint -color
+
+      - name: Validate production configuration (example values)
+        run: |
+          sed -e 's/change-me-openssl-rand-hex-32/ci0123456789abcdef0123456789abcdef/' \
+              -e 's/^HUB_DOMAIN=.*/HUB_DOMAIN=hub.ci.invalid/' hub.env.example > hub.env
+          echo '{"halls": {}}' > halls.json
+          python3 scripts/apply.py --dry-run
+
+      - name: Validate local configuration
+        run: |
+          docker compose --env-file local/hub.env.local config --quiet
+          docker compose --env-file local/hub.env.local run --rm --no-deps -T --entrypoint caddy caddy \
+            validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
+  smoke:
+    name: End-to-end smoke test (local hub)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the smoke test
+        env:
+          WS_IDLE: "30"
+        run: scripts/smoke_local.sh
