@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import importlib.util
 import json
 import os
@@ -164,10 +165,43 @@ class HttpTests(AskTestCase):
 
     def test_public_endpoints(self) -> None:
         self.assertEqual(self.get("/healthz")[2], b"ok\n")
-        self.assertIn(b"Halls connected: 1.", self.get("/")[2])
+        self.assertIn(b"Halls connected: 1.", self.get("/status")[2])
         self.assertEqual(json.loads(self.get("/api/halls/hall-a")[2]), {"online": True})
         self.assertEqual(json.loads(self.get("/api/halls/hall-b")[2]), {"online": False})
         self.assertEqual(self.get("/api/halls/Bad_Name")[0], 400)
+
+    def test_landing_page(self) -> None:
+        status, headers, body = self.get("/")
+        self.assertEqual((status, headers["Content-Type"]), (200, "text/html; charset=utf-8"))
+        self.assertIn(b'action="/go"', body)
+        self.assertIn(b'data-message=""', body)
+
+    def go(self, query: str) -> tuple[int, str | None, bytes]:
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=5)
+        self.addCleanup(conn.close)
+        conn.request("GET", "/go?" + query)
+        response = conn.getresponse()
+        return response.status, response.getheader("Location"), response.read()
+
+    def test_go_redirects_a_valid_code_and_forgives_typing(self) -> None:
+        self.assertEqual(self.go("code=k7m4p2")[:2], (303, "/k7m4p2"))
+        self.assertEqual(self.go("code=+K7M-4P2+")[:2], (303, "/k7m4p2"))
+        self.assertEqual(self.go("code=https%3A%2F%2Fmeet.solin.run%2Fk7m4p2")[:2], (303, "/k7m4p2"))
+
+    def test_go_keeps_an_invalid_code_on_the_landing_page(self) -> None:
+        status, location, body = self.go("code=abc123")   # vowels and 1 are not in codes
+        self.assertEqual((status, location), (200, None))
+        self.assertIn(b'data-message="invalid" data-code="abc123"', body)
+        status, _, body = self.go("code=%3Cscript%3E")
+        self.assertIn(b'data-code="&lt;script&gt;"', body)
+        self.assertIn(b'data-message=""', self.go("code=")[2])
+
+    def test_an_unknown_meeting_code_shows_the_landing_page(self) -> None:
+        for path in ("/k7m4p2", "/k7m4p2/m", "/k7m4p2/s"):
+            status, _, body = self.get(path)
+            self.assertEqual(status, 404)
+            self.assertIn(b'data-message="notfound" data-code="k7m4p2"', body)
+        self.assertEqual(self.get("/nothere")[2], b"not found\n")
 
     def test_plugin_fails_closed_on_garbage(self) -> None:
         with self.assertLogs("ask", "ERROR"):

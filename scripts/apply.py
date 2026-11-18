@@ -38,7 +38,7 @@ SERVICES = ("ask", "frps", "coturn", "caddy")
 DISRUPTIVE = frozenset({"frps", "coturn"})
 # Files each service reads at runtime (bind mounts). Changes to them are invisible to compose.
 SERVICE_FILES = {
-    "ask": ("ask/ask.py", "ask/Dockerfile"),
+    "ask": ("ask/ask.py", "ask/landing.html", "ask/Dockerfile"),
     "frps": ("frps.toml",),
     "coturn": ("turnserver.conf", "coturn-entrypoint.sh"),
     "caddy": ("Caddyfile", "sites.caddy"),

@@ -196,7 +196,7 @@ cd /opt/solin-hub
 docker compose ps                         # four services, all "running"
 docker compose logs --tail 50 caddy       # certificate for HUB_DOMAIN obtained
 curl -s https://<HUB_DOMAIN>/healthz      # ok
-curl -s https://<HUB_DOMAIN>/             # "The hub is running. Halls connected: 0."
+curl -s https://<HUB_DOMAIN>/status       # "The hub is running. Halls connected: 0."
 ```
 
 TURN has to be checked **from another machine**, outside the VPS:

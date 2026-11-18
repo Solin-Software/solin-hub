@@ -11,7 +11,10 @@ Internal endpoints (bound to 127.0.0.1, never routed publicly by Caddy):
                                           only publish its own proxy, and the hub decides the
                                           proxy's remote port.
 Public endpoints (served on https://<HUB_DOMAIN>/):
-  GET  /                    tiny status page
+  GET  /                    landing page: type a meeting code to go to https://<HUB_DOMAIN>/<code>
+  GET  /go?code=<code>      the same without JavaScript: redirects to /<code> (or back with an error)
+  GET  /<code>[/...]        a meeting code no hall serves (yet): the landing page with a message
+  GET  /status              tiny status page
   GET  /api/halls/<name>    {"online": bool}
   GET  /healthz             "ok"
 
@@ -34,7 +37,8 @@ import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from pathlib import Path
+from urllib.parse import parse_qs, quote, urlparse
 
 log = logging.getLogger("ask")
 
@@ -49,7 +53,11 @@ PORT_MAX = int(os.environ.get("HALL_PORT_MAX", "20999"))
 ONLINE_CACHE_S = 2.0
 
 HALL_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+# Meeting codes as Solin draws them: 6 characters, no vowels (no words) and nothing easy to misread.
+MEETING_CODE = re.compile(r"^[23456789bcdfghjkmnpqrstvwxyz]{6}$")
+LANDING = (Path(__file__).with_name("landing.html")).read_text(encoding="utf-8")
 PORT_HEADER = "X-Solin-Hall-Port"
+HTML = "text/html; charset=utf-8"
 
 
 class Halls:
@@ -199,6 +207,19 @@ def page(title: str, text: str, refresh: int | None = None) -> bytes:
     return PAGE.format(refresh=meta, title=html.escape(title), text=text).encode("utf-8")
 
 
+def normalize_code(text: str) -> str:
+    """What people type or paste: capitals, spaces, dashes, or the whole link."""
+
+    return re.sub(r"[\s-]", "", text.strip().lower().rsplit("/", 1)[-1])
+
+
+def landing(message: str = "", code: str = "") -> bytes:
+    """message: "" | "invalid" | "notfound" (the page shows it in the visitor's language)."""
+
+    return (LANDING.replace("{{MESSAGE}}", html.escape(message))
+            .replace("{{CODE}}", html.escape(code)).encode("utf-8"))
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "solin-hub-ask"
     sys_version = ""
@@ -235,18 +256,30 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/healthz":
             self._send(200, b"ok\n")
         elif path == "/":
+            self._send(200, landing(), HTML)
+        elif path == "/go":
+            code = normalize_code((parse_qs(url.query).get("code") or [""])[0])
+            if MEETING_CODE.match(code):
+                self._send(303, headers={"Location": f"/{quote(code)}"})
+            else:
+                self._send(200, landing("invalid" if code else "", code[:12]), HTML)
+        elif path == "/status":
             try:
                 n = len([x for x in online.names() if halls.get(x) is not None])
                 text = f"The hub is running. Halls connected: {n}."
             except Exception:  # noqa: BLE001
                 text = "The hub is running, but the tunnel server is not answering."
-            self._send(200, page("Solin meeting hub", text), "text/html; charset=utf-8")
+            self._send(200, page("Solin meeting hub", text), HTML)
         elif path.startswith("/api/halls/"):
             name = path[len("/api/halls/"):].strip("/").lower()
             if not HALL_NAME.match(name):
                 self._json(400, {"error": "invalid hall name"})
             else:
                 self._json(200, {"online": halls.get(name) is not None and online.is_online(name)})
+        elif MEETING_CODE.match(path.strip("/").split("/", 1)[0]):
+            # Codes are routed to halls by the hub's code registry (not built yet): until then
+            # every code lands here.
+            self._send(404, landing("notfound", path.strip("/").split("/", 1)[0]), HTML)
         else:
             self._send(404, b"not found\n")
 

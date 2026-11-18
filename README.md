@@ -138,7 +138,9 @@ TURN for Galene's `ice-servers.json` (Solin's `TurnServer`):
 `turns:` on 5349 is not enabled yet; see "Left for later".
 
 Public endpoints on the hub domain:
-- `GET https://HUB_DOMAIN/`: status page (number of connected halls, no names).
+- `GET https://HUB_DOMAIN/`: landing page: visitors type a meeting code and go to `https://HUB_DOMAIN/<code>`
+  (`/go?code=` does the same without JavaScript). Codes no hall serves yet show the landing page with a note.
+- `GET https://HUB_DOMAIN/status`: status page (number of connected halls, no names).
 - `GET https://HUB_DOMAIN/api/halls/<name>`: `{"online": true|false}`. Solin can use it to confirm its public URL works.
 - `GET https://HUB_DOMAIN/healthz`: `ok`.
 
