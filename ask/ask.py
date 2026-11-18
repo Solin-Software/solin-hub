@@ -91,6 +91,14 @@ def digest(secret: str) -> str:
     return hashlib.sha256(secret.encode("utf-8")).hexdigest()
 
 
+def clean_title(value: object) -> str:
+    return " ".join(str(value or "").split())[:MAX_TITLE]
+
+
+def clean_kind(value: object) -> str:
+    return str(value) if value in KINDS else ""
+
+
 class Codes:
     """The code registry: {code: {"owner", "starts_at", "title", "kind", "active", "created_at", "seen_at"}}.
 
@@ -275,14 +283,6 @@ def turn_credentials(code: str, now: float) -> dict:
     host = f"[{TURN_HOST}]" if ":" in TURN_HOST and not TURN_HOST.startswith("[") else TURN_HOST
     return {"urls": [f"turn:{host}:{TURN_PORT}?transport=udp", f"turn:{host}:{TURN_PORT}?transport=tcp"],
             "username": username, "credential": credential, "ttl": TURN_TTL_S}
-
-
-def clean_title(value: object) -> str:
-    return " ".join(str(value or "").split())[:MAX_TITLE]
-
-
-def clean_kind(value: object) -> str:
-    return str(value) if value in KINDS else ""
 
 
 def parse_sync(body: dict) -> list[tuple[str, str, str, bool, str, str]] | None:

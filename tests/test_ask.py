@@ -74,10 +74,13 @@ class CodeRegistryTests(AskTestCase):
         self.assertEqual(self.ask.codes.lookup(mine)["kind"], "weekend")
         self.assertTrue(self.ask.codes.lookup(theirs)["active"])
         # The owner can bring a code back.
-        self.ask.codes.sync([(mine, "mine", "", True, "", "")], 300.0)
+        self.ask.codes.sync([(mine, "mine", "", True, "Central", "")], 300.0)
         self.assertTrue(self.ask.codes.lookup(mine)["active"])
-        # Saved, and read back by a fresh registry.
+        # Saved, and read back by a fresh registry, names included.
         self.assertTrue(self.ask.Codes(str(self.codes_path)).owns(mine, "mine"))
+        self.assertEqual(self.ask.Codes(str(self.codes_path)).lookup(mine)["title"], "Central")
+        # The module itself starts from a saved registry (as the deployed service does).
+        self.assertTrue(load_ask(str(self.codes_path)).codes.owns(mine, "mine"))
 
     def test_codes_nobody_syncs_are_forgotten_after_a_long_time(self) -> None:
         old = self.new_code("old", now=100.0)
