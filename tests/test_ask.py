@@ -19,9 +19,9 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def load_ask(halls_file: str):
+def load_ask(halls_file: str, codes_file: str):
     env = {"HUB_DOMAIN": "Hub.Example.Test.", "FRP_ADMIN_PASSWORD": "pw", "HALLS_FILE": halls_file,
-           "HALL_PORT_MIN": "20000", "HALL_PORT_MAX": "20099"}
+           "CODES_FILE": codes_file, "HALL_PORT_MIN": "20000", "HALL_PORT_MAX": "20099"}
     with mock.patch.dict(os.environ, env):
         spec = importlib.util.spec_from_file_location("ask_under_test", ROOT / "ask" / "ask.py")
         module = importlib.util.module_from_spec(spec)
@@ -40,7 +40,8 @@ class AskTestCase(unittest.TestCase):
         self.halls_path = Path(self.dir.name) / "halls.json"
         self.write_halls({"hall-a": {"key_sha256": digest("key-a"), "port": 20001},
                           "hall-b": {"key_sha256": digest("key-b"), "port": 20002}})
-        self.ask = load_ask(str(self.halls_path))
+        self.codes_path = Path(self.dir.name) / "codes.json"
+        self.ask = load_ask(str(self.halls_path), str(self.codes_path))
         self.online_names: set[str] = {"hall-a"}
         patcher = mock.patch.object(self.ask.online, "names", side_effect=lambda: set(self.online_names))
         patcher.start()
@@ -87,17 +88,45 @@ class HallRegistryTests(AskTestCase):
             self.assertIsNotNone(self.ask.halls.get("hall-c"))
 
 
-class HostTests(AskTestCase):
-    def test_hall_from_host(self) -> None:
-        hall = self.ask.hall_from_host
-        self.assertEqual(hall("hall-a.hub.example.test"), "hall-a")
-        self.assertEqual(hall("HALL-A.hub.example.test:443"), "hall-a")
-        self.assertEqual(hall("hall-a.hub.example.test."), "hall-a")
-        self.assertIsNone(hall("hub.example.test"))
-        self.assertIsNone(hall("a.b.hub.example.test"))
-        self.assertIsNone(hall("hall-a.other.test"))
-        self.assertIsNone(hall("[::1]:443"))
-        self.assertIsNone(hall(""))
+class CodeRegistryTests(AskTestCase):
+    def test_a_hall_registers_and_retires_its_codes(self) -> None:
+        codes = self.ask.codes
+        self.assertEqual(codes.register("hall-a", {"k7m4p2": "2026-11-20T19:30:00-03:00", "b2c3d4": ""}, [], 100.0), [])
+        self.assertEqual(codes.lookup("k7m4p2"), {"hall": "hall-a", "starts_at": "2026-11-20T19:30:00-03:00",
+                                                  "retired_at": 0.0})
+        # A code left out is retired; one listed as retired is recorded even if never active.
+        self.assertEqual(codes.register("hall-a", {"k7m4p2": ""}, ["zzzzzz"], 200.0), [])
+        self.assertEqual(codes.lookup("b2c3d4")["retired_at"], 200.0)
+        self.assertEqual(codes.lookup("zzzzzz")["hall"], "hall-a")
+        # Saved, and read back by a fresh registry.
+        again = self.ask.Codes(str(self.codes_path))
+        self.assertEqual(again.lookup("b2c3d4")["retired_at"], 200.0)
+
+    def test_another_halls_codes_are_refused_and_nothing_changes(self) -> None:
+        codes = self.ask.codes
+        codes.register("hall-a", {"k7m4p2": ""}, ["b2c3d4"], 100.0)
+        self.assertEqual(codes.register("hall-b", {"k7m4p2": "", "b2c3d4": "", "x9x9x9": ""}, [], 150.0),
+                         ["b2c3d4", "k7m4p2"])
+        self.assertIsNone(codes.lookup("x9x9x9"))
+        # Another hall's code listed as retired is ignored.
+        self.assertEqual(codes.register("hall-b", {}, ["k7m4p2"], 150.0), [])
+        self.assertEqual(codes.lookup("k7m4p2"), {"hall": "hall-a", "starts_at": "", "retired_at": 0.0})
+
+    def test_retired_codes_are_forgotten_after_a_long_time(self) -> None:
+        codes = self.ask.codes
+        codes.register("hall-a", {}, ["b2c3d4"], 100.0)
+        codes.register("hall-a", {}, [], 100.0 + self.ask.RETIRED_FOR_S + 1)
+        self.assertIsNone(codes.lookup("b2c3d4"))
+        self.assertEqual(codes.register("hall-b", {"b2c3d4": ""}, [], 100.0 + self.ask.RETIRED_FOR_S + 2), [])
+
+    def test_parse_codes(self) -> None:
+        parse = self.ask.parse_codes
+        self.assertEqual(parse({"codes": [{"code": "k7m4p2", "startsAt": "x"}], "retired": ["b2c3d4"]}),
+                         ({"k7m4p2": "x"}, ["b2c3d4"]))
+        self.assertEqual(parse({"codes": []}), ({}, []))
+        for bad in ({}, {"codes": "k7m4p2"}, {"codes": [{"code": "abc123"}]}, {"codes": [], "retired": ["NOPE"]},
+                    {"codes": [{"code": "k7m4p2", "startsAt": "x" * 41}]}):
+            self.assertIsNone(parse(bad), bad)
 
 
 class PluginTests(AskTestCase):
@@ -147,21 +176,51 @@ class HttpTests(AskTestCase):
             with error:
                 return error.code, dict(error.headers), error.read()
 
-    def test_tls_gate(self) -> None:
-        self.assertEqual(self.get("/internal/caddy-ask?domain=hub.example.test")[0], 200)
-        self.assertEqual(self.get("/internal/caddy-ask?domain=hall-a.hub.example.test")[0], 200)
-        self.assertEqual(self.get("/internal/caddy-ask?domain=hall-b.hub.example.test")[0], 403)  # offline
-        self.assertEqual(self.get("/internal/caddy-ask?domain=nobody.hub.example.test")[0], 403)
-        self.assertEqual(self.get("/internal/caddy-ask?domain=example.com")[0], 403)
+    def put_codes(self, hall: str, key: str, body) -> tuple[int, dict]:
+        data = body if isinstance(body, bytes) else json.dumps(body).encode()
+        request = urllib.request.Request(f"{self.base}/api/halls/{hall}/codes", data=data, method="PUT",
+                                         headers={"Authorization": f"Bearer {key}",
+                                                  "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            with error:
+                return error.code, json.loads(error.read())
+
+    def route(self, uri: str):
+        return self.get("/internal/route", {"X-Forwarded-Uri": uri})
+
+    def test_put_codes(self) -> None:
+        body = {"codes": [{"code": "k7m4p2", "startsAt": "2026-11-20T19:30:00-03:00"}], "retired": []}
+        self.assertEqual(self.put_codes("hall-a", "key-a", body), (200, {"ok": True}))
+        self.assertEqual(self.put_codes("hall-a", "key-b", body)[0], 401)
+        self.assertEqual(self.put_codes("nobody", "key-a", body)[0], 401)
+        self.assertEqual(self.put_codes("hall-b", "key-b", body), (409, {"taken": ["k7m4p2"]}))
+        self.assertEqual(self.put_codes("hall-a", "key-a", b"{not json")[0], 400)
+        self.assertEqual(self.put_codes("hall-a", "key-a", {"codes": [{"code": "aeiou1"}]})[0], 400)
 
     def test_route(self) -> None:
-        status, headers, _ = self.get("/internal/route", {"X-Forwarded-Host": "hall-a.hub.example.test"})
-        self.assertEqual((status, headers.get("X-Solin-Hall-Port")), (200, "20001"))
-        status, headers, body = self.get("/internal/route", {"X-Forwarded-Host": "hall-b.hub.example.test"})
-        self.assertEqual((status, headers.get("Retry-After")), (503, "5"))
-        self.assertIn(b"not connected", body)
+        self.ask.codes.register("hall-a", {"k7m4p2": ""}, ["b2c3d4"], 100.0)
+        self.ask.codes.register("hall-b", {"x9x9x9": "2026-11-20T19:30:00-03:00"}, [], 100.0)
+        for uri in ("/k7m4p2", "/k7m4p2/", "/k7m4p2/m", "/k7m4p2/ws?x=1"):
+            status, headers, _ = self.route(uri)
+            self.assertEqual((status, headers.get("X-Solin-Hall-Port")), (200, "20001"), uri)
+        # hall-b is offline: the waiting page, with the start time for its countdown.
+        status, headers, body = self.route("/x9x9x9/s")
+        self.assertEqual((status, headers.get("Retry-After")), (503, "10"))
+        self.assertIn(b'data-message="waiting" data-code="x9x9x9" data-starts="2026-11-20T19:30:00-03:00"', body)
         self.assertNotIn("X-Solin-Hall-Port", headers)
-        self.assertEqual(self.get("/internal/route", {"X-Forwarded-Host": "nobody.hub.example.test"})[0], 404)
+        status, _, body = self.route("/b2c3d4")
+        self.assertEqual(status, 410)
+        self.assertIn(b'data-message="retired"', body)
+        for uri in ("/zzzzzz", "/zzzzzzz", "/", ""):
+            status, headers, body = self.route(uri)
+            self.assertEqual(status, 404, uri)
+            self.assertNotIn("X-Solin-Hall-Port", headers)
+        # A hall removed from halls.json no longer serves its codes.
+        self.write_halls({"hall-b": {"key_sha256": digest("key-b"), "port": 20002}})
+        self.assertEqual(self.route("/k7m4p2")[0], 404)
 
     def test_public_endpoints(self) -> None:
         self.assertEqual(self.get("/healthz")[2], b"ok\n")

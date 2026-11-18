@@ -6,9 +6,6 @@
 	skip_install_trust
 	http_port {$HTTP_PORT:8880}
 	https_port {$HTTPS_PORT:8443}
-	on_demand_tls {
-		ask http://127.0.0.1:{$ASK_PORT:7400}/internal/caddy-ask
-	}
 }
 
 import /etc/caddy/sites.caddy

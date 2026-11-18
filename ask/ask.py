@@ -1,11 +1,14 @@
-"""Solin hub control service ("ask"). Standard library only; holds no meeting state.
+"""Solin hub control service ("ask"). Standard library only.
+
+Every meeting is at https://<HUB_DOMAIN>/<code>: a 6-character code that the hall's Solin
+drew and registered here. The ask service keeps the code registry (CODES_FILE) and tells Caddy
+which hall's tunnel serves each code.
 
 Internal endpoints (bound to 127.0.0.1, never routed publicly by Caddy):
-  GET  /internal/caddy-ask?domain=<host>  Caddy on-demand TLS gate: 200 for the hub domain and
-                                          for <hall>.<hub> while that hall's tunnel is online.
-  GET  /internal/route                    Caddy forward_auth: maps the request's Host to the
-                                          hall's tunnel port (X-Solin-Hall-Port), or answers
-                                          the visitor directly when the hall is offline/unknown.
+  GET  /internal/route                    Caddy forward_auth for /<code>/...: maps the code to
+                                          its hall's tunnel port (X-Solin-Hall-Port), or answers
+                                          the visitor directly (unknown code, link no longer
+                                          valid, meeting not open yet).
   POST /internal/frps-plugin?op=...       frps server plugin (Login, NewProxy): only registered
                                           halls with the right key may connect, each hall may
                                           only publish its own proxy, and the hub decides the
@@ -16,6 +19,10 @@ Public endpoints (served on https://<HUB_DOMAIN>/):
   GET  /<code>[/...]        a meeting code no hall serves (yet): the landing page with a message
   GET  /status              tiny status page
   GET  /api/halls/<name>    {"online": bool}
+  PUT  /api/halls/<name>/codes   the hall's codes (Authorization: Bearer <hall key>):
+                            {"codes": [{"code": "k7m4p2", "startsAt": "<ISO>" | ""}], "retired": [...]}
+                            200 {"ok": true}, or 409 {"taken": [...]} when another hall has some
+                            of them (nothing is changed; the hall draws new ones and retries).
   GET  /healthz             "ok"
 
 Halls are registered in halls.json (re-read automatically when the file changes):
@@ -56,6 +63,12 @@ HALL_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 # Meeting codes as Solin draws them: 6 characters, no vowels (no words) and nothing easy to misread.
 MEETING_CODE = re.compile(r"^[23456789bcdfghjkmnpqrstvwxyz]{6}$")
 LANDING = (Path(__file__).with_name("landing.html")).read_text(encoding="utf-8")
+CODES_FILE = os.environ.get("CODES_FILE", "/data/codes.json")
+# A code a hall stopped using shows "no longer valid" (and is never handed to another hall) this long.
+RETIRED_FOR_S = 400 * 24 * 3600
+MAX_ACTIVE_CODES = 200
+MAX_RETIRED_CODES = 2000
+MAX_BODY = 256 * 1024
 PORT_HEADER = "X-Solin-Hall-Port"
 HTML = "text/html; charset=utf-8"
 
@@ -152,20 +165,90 @@ class Online:
             return False
 
 
+class Codes:
+    """The meeting-code registry: {code: {"hall", "starts_at" (ISO or ""), "retired_at" (0 = in use)}}.
+
+    A code belongs to one hall. Codes the hall stops using are kept as retired for
+    RETIRED_FOR_S, so their link says "no longer valid" and no other hall can take them.
+    Saved atomically after every change.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+        self._codes: dict[str, dict] = {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f).get("codes") or {}
+            self._codes = {str(code): {"hall": str(e["hall"]), "starts_at": str(e.get("starts_at") or ""),
+                                       "retired_at": float(e.get("retired_at") or 0)}
+                           for code, e in raw.items() if MEETING_CODE.match(str(code))}
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, AttributeError, KeyError, TypeError) as e:
+            log.error("cannot read %s (%s); starting with no codes", path, e)
+
+    def lookup(self, code: str) -> dict | None:
+        with self._lock:
+            entry = self._codes.get(code)
+            return dict(entry) if entry else None
+
+    def register(self, hall: str, active: dict[str, str], retired: list[str], now: float) -> list[str]:
+        """Make `active` (code -> start time) the hall's codes; returns the codes other halls hold."""
+
+        with self._lock:
+            taken = sorted(c for c in active if c in self._codes and self._codes[c]["hall"] != hall)
+            if taken:
+                return taken
+            for code, entry in self._codes.items():
+                if entry["hall"] == hall and not entry["retired_at"] and code not in active:
+                    entry["retired_at"] = now
+            for code in retired:
+                entry = self._codes.get(code)
+                if code in active or (entry and entry["hall"] != hall):
+                    continue
+                if entry is None:
+                    self._codes[code] = {"hall": hall, "starts_at": "", "retired_at": now}
+                elif not entry["retired_at"]:
+                    entry["retired_at"] = now
+            for code, starts_at in active.items():
+                self._codes[code] = {"hall": hall, "starts_at": starts_at, "retired_at": 0.0}
+            self._codes = {code: e for code, e in self._codes.items()
+                           if not e["retired_at"] or now - e["retired_at"] < RETIRED_FOR_S}
+            self._save()
+            return []
+
+    def _save(self) -> None:
+        tmp = f"{self.path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"codes": self._codes}, f, separators=(",", ":"))
+        os.replace(tmp, self.path)
+
+
 halls = Halls(HALLS_FILE)
 online = Online()
+codes = Codes(CODES_FILE)
 
 
-def hall_from_host(host: str) -> str | None:
-    host = (host or "").strip().lower().rstrip(".")
-    if host.startswith("["):
+def parse_codes(body: dict) -> tuple[dict[str, str], list[str]] | None:
+    """A hall's PUT body -> (active code -> start time, retired codes), or None when malformed."""
+
+    items, retired = body.get("codes"), body.get("retired") or []
+    if not isinstance(items, list) or not isinstance(retired, list):
         return None
-    host = host.split(":", 1)[0]
-    suffix = "." + HUB
-    if not host.endswith(suffix):
+    if len(items) > MAX_ACTIVE_CODES or len(retired) > MAX_RETIRED_CODES:
         return None
-    name = host[: -len(suffix)]
-    return name if HALL_NAME.match(name) else None
+    active: dict[str, str] = {}
+    for item in items:
+        if not isinstance(item, dict) or not MEETING_CODE.match(str(item.get("code", ""))):
+            return None
+        starts_at = str(item.get("startsAt") or "")
+        if len(starts_at) > 40:
+            return None
+        active[item["code"]] = starts_at
+    if not all(isinstance(c, str) and MEETING_CODE.match(c) for c in retired):
+        return None
+    return active, retired
 
 
 def plugin_decision(op: str, body: dict) -> dict:
@@ -213,11 +296,11 @@ def normalize_code(text: str) -> str:
     return re.sub(r"[\s-]", "", text.strip().lower().rsplit("/", 1)[-1])
 
 
-def landing(message: str = "", code: str = "") -> bytes:
-    """message: "" | "invalid" | "notfound" (the page shows it in the visitor's language)."""
+def landing(message: str = "", code: str = "", starts_at: str = "") -> bytes:
+    """message: "" | "invalid" | "notfound" | "retired" | "waiting" (shown in the visitor's language)."""
 
-    return (LANDING.replace("{{MESSAGE}}", html.escape(message))
-            .replace("{{CODE}}", html.escape(code)).encode("utf-8"))
+    return (LANDING.replace("{{MESSAGE}}", html.escape(message)).replace("{{CODE}}", html.escape(code))
+            .replace("{{STARTS}}", html.escape(starts_at)).encode("utf-8"))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -245,13 +328,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         url = urlparse(self.path)
         path = url.path
-        if path == "/internal/caddy-ask":
-            domain = (parse_qs(url.query).get("domain") or [""])[0].lower().rstrip(".")
-            name = hall_from_host(domain)
-            ok = domain == HUB or (name is not None and halls.get(name) is not None and online.is_online(name))
-            log.info("caddy-ask %s -> %s", domain, "allow" if ok else "deny")
-            self._send(200 if ok else 403)
-        elif path == "/internal/route":
+        if path == "/internal/route":
             self._route()
         elif path == "/healthz":
             self._send(200, b"ok\n")
@@ -277,27 +354,56 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json(200, {"online": halls.get(name) is not None and online.is_online(name)})
         elif MEETING_CODE.match(path.strip("/").split("/", 1)[0]):
-            # Codes are routed to halls by the hub's code registry (not built yet): until then
-            # every code lands here.
+            # Caddy routes /<code>/... through /internal/route; only a direct request lands here.
             self._send(404, landing("notfound", path.strip("/").split("/", 1)[0]), HTML)
         else:
             self._send(404, b"not found\n")
 
     def _route(self) -> None:
-        host = self.headers.get("X-Forwarded-Host") or self.headers.get("Host") or ""
-        name = hall_from_host(host)
-        hall = halls.get(name) if name else None
-        if hall is None:
-            self._send(404, page("No such meeting address",
-                                 "Check the link you received from your congregation."),
-                       "text/html; charset=utf-8")
-        elif not online.is_online(name):
-            self._send(503, page("The hall is not connected right now",
-                                 "The meeting may not have started yet, or the hall's internet connection "
-                                 "dropped for a moment. This page retries automatically.", refresh=10),
-                       "text/html; charset=utf-8", {"Retry-After": "5"})
+        uri = self.headers.get("X-Forwarded-Uri") or ""
+        code = urlparse(uri).path.strip("/").split("/", 1)[0].lower()
+        entry = codes.lookup(code) if MEETING_CODE.match(code) else None
+        hall = halls.get(entry["hall"]) if entry else None
+        if entry is None or hall is None:
+            self._send(404, landing("notfound", code[:12]), HTML)
+        elif entry["retired_at"]:
+            self._send(410, landing("retired", code), HTML)
+        elif not online.is_online(entry["hall"]):
+            # The hall's Solin opens its tunnel when the meeting opens; the page polls until then.
+            self._send(503, landing("waiting", code, entry["starts_at"]), HTML, {"Retry-After": "10"})
         else:
             self._send(200, headers={PORT_HEADER: str(hall["port"])})
+
+    def do_PUT(self) -> None:
+        parts = urlparse(self.path).path.strip("/").split("/")
+        if len(parts) != 4 or parts[:2] != ["api", "halls"] or parts[3] != "codes":
+            self._send(404, b"not found\n")
+            return
+        name = parts[2].lower()
+        auth = self.headers.get("Authorization") or ""
+        key = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
+        if halls.check_key(name, key) is None:
+            self._json(401, {"error": "unknown hall or wrong hall key"})
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        if not 0 < length <= MAX_BODY:
+            self._json(413 if length else 400, {"error": "body missing or too large"})
+            return
+        try:
+            body = json.loads(self.rfile.read(length))
+        except ValueError:
+            body = None
+        parsed = parse_codes(body) if isinstance(body, dict) else None
+        if parsed is None:
+            self._json(400, {"error": "expected {codes: [{code, startsAt}], retired: [code]}"})
+            return
+        taken = codes.register(name, parsed[0], parsed[1], time.time())
+        if taken:
+            log.info("codes for hall=%r: %d taken by other halls", name, len(taken))
+            self._json(409, {"taken": taken})
+        else:
+            log.info("codes for hall=%r: %d active, %d retired", name, len(parsed[0]), len(parsed[1]))
+            self._json(200, {"ok": True})
 
     def do_POST(self) -> None:
         url = urlparse(self.path)

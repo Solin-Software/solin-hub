@@ -1,10 +1,10 @@
 # Solin meeting hub
 
 The hub is a small VPS that gives each hall running Solin hosted meetings two things:
-- a public HTTPS address, `https://<hall>.<HUB_DOMAIN>/`, that works even when the hall is behind CGNAT;
+- public HTTPS links for its meetings, `https://<HUB_DOMAIN>/<code>`, that work even when the hall is behind CGNAT;
 - a TURN relay for attendees whose network blocks direct media.
 
-The hub holds **no meeting state**. Lobby, tokens, attendance and media rules all live on the hall PC. One hub can serve many halls.
+The hub keeps only the **meeting-code registry**: which hall serves each 6-character code. Lobby, passwords, tokens, attendance and media rules all live on the hall PC. One hub can serve many halls, all under one address.
 
 The hall side (Solin, its meeting web server, Galene and `frpc`) lives in the [Solin repository](https://github.com/Solin-Software/Solin). To install a hub, see **[INSTALL.md](INSTALL.md)**.
 
@@ -33,7 +33,7 @@ All four use host networking. coturn needs a large UDP port range, and everythin
 
 **How Caddy reaches a hall: raw TCP proxies, plus a per-request port lookup.**
 - Each hall's proxy is `type = "tcp"`. The hub pins it to that hall's port from `halls.json`, on `127.0.0.1:20000-20999`, so it is not reachable from outside.
-- For every request to `<hall>.HUB_DOMAIN`, Caddy's `forward_auth` asks the ask service for the hall's port (header `X-Solin-Hall-Port`). It then reverse-proxies to `127.0.0.1:<port>`. This adds a loopback call of under a millisecond per HTTP request. A WebSocket counts as one request.
+- For every request to `HUB_DOMAIN/<code>/...`, Caddy's `forward_auth` asks the ask service which hall registered the code, and gets that hall's port (header `X-Solin-Hall-Port`). It then reverse-proxies to `127.0.0.1:<port>`. This adds a loopback call of under a millisecond per HTTP request. A WebSocket counts as one request.
 
 Why not frp's HTTP vhost (`type = "http"`, `vhostHTTPPort`)?
 - In the S5 spike, frp's HTTP vhost proxy closed long-lived WebSockets after about 60 s.
@@ -54,7 +54,14 @@ What the lookup buys:
 - So a hall cannot claim another hall's name, nor pick its own port. frps also rejects a second proxy with the same name.
 - `halls.json` holds only key hashes. Edits are picked up live.
 
-**Certificates.** Caddy's `on_demand_tls` asks `/internal/caddy-ask` before issuing a certificate. Only the hub domain and `<registered hall>.HUB_DOMAIN` while that hall's tunnel is online are approved. Random subdomains cannot make the hub burn its Let's Encrypt rate limits.
+**Meeting codes.** Each hall's Solin draws its codes and sends the full list whenever it changes (`PUT /api/halls/<hall>/codes`, with the hall key). The hub refuses a list containing another hall's code (409, naming the codes), and Solin draws new ones. Codes a hall stops using are kept as retired for 400 days: their link says "no longer valid" and no other hall can take them. The registry is `codes.json` in the `ask-data` volume.
+
+What a visitor to `HUB_DOMAIN/<code>` gets:
+- the hall's meeting, while its Solin has the meeting open (tunnel connected);
+- the hub's waiting page, with a countdown to the start, while the hall is offline; it reloads until the meeting opens;
+- "no longer valid" (410) for a retired code, and the landing page with "no such meeting" (404) for an unknown one.
+
+**Certificates.** One, for `HUB_DOMAIN`, obtained and renewed by Caddy as usual.
 
 **TURN.**
 - coturn uses `use-auth-secret` with `TURN_SECRET`. Galene on the hall mints time-limited credentials (TURN REST: `username = <expiry>:<name>`, `password = base64(HMAC-SHA1(secret, username))`).
@@ -76,7 +83,7 @@ sslip.io resolves `<anything>.<ip-with-dashes>.sslip.io` to that IP. For a VPS a
 ```
 HUB_DOMAIN=203-0-113-10.sslip.io
 ```
-- Halls become `https://hall-abc123.203-0-113-10.sslip.io/`, and the hub is `https://203-0-113-10.sslip.io/`.
+- Meetings become `https://203-0-113-10.sslip.io/<code>`.
 - Let's Encrypt issues real certificates over the HTTP challenge on port 80. No DNS setup is needed.
 - Good for tests and small deployments.
 - Caveats:
@@ -122,8 +129,8 @@ Rules the hub enforces:
 
 `loginFailExit = false` keeps frpc retrying while the hub is unreachable or the key is not registered yet.
 
-Once frpc logs `start proxy success`, the hall is live at `https://${HALL_NAME}.${HUB_DOMAIN}/`. The first visit takes a few seconds while the certificate is issued. The meeting web server receives plain HTTP from `127.0.0.1` with these headers:
-- `Host: <hall>.<HUB_DOMAIN>`
+Once frpc logs `start proxy success`, the hall's registered codes are live at `https://${HUB_DOMAIN}/<code>`. The meeting web server receives plain HTTP from `127.0.0.1`, with the path unchanged (`/<code>/...`) and these headers:
+- `Host: <HUB_DOMAIN>`
 - `X-Forwarded-Proto: https`
 - `X-Forwarded-Host`
 - `X-Forwarded-For: <attendee IP>`
@@ -179,8 +186,8 @@ It brings up the local variant and starts dummy halls (`scripts/hubtest.py hall`
 
 `scripts/hubtest.py` also works against a real hub:
 ```sh
-python3 scripts/hubtest.py http https://hall-abc123.$HUB_DOMAIN/
-python3 scripts/hubtest.py ws wss://hall-abc123.$HUB_DOMAIN/ws --idle 300   # needs a WS echo at /ws
+python3 scripts/hubtest.py http https://$HUB_DOMAIN/<code>/
+python3 scripts/hubtest.py ws wss://$HUB_DOMAIN/<code>/ws --idle 300   # needs a WS echo at /<code>/ws
 python3 scripts/hubtest.py turn $PUBLIC_IP --secret "$TURN_SECRET" --peer 8.8.8.8 --denied-peer 10.0.0.1
 python3 scripts/hubtest.py turn $PUBLIC_IP --tcp --secret "$TURN_SECRET"
 ```
@@ -194,8 +201,9 @@ Run the TURN check from **outside** the VPS.
 | frpc: `unknown hall or wrong hall key` | The hall is not in `halls.json`, or the key is wrong. Check `docker compose logs ask` (`Login rejected`) and the file's validity: ask logs a parse error and keeps the previous registry. |
 | frpc: `the proxy must be named ...` / `only one proxy of type 'tcp'` | The hall's frpc.toml is not the template: the proxy name must equal `HALL_NAME`, with no `user`. |
 | frpc: `port not allowed` / `port already used` | The hall's `port` in halls.json is outside `HALL_PORT_MIN`–`HALL_PORT_MAX`, or the same hall is connected twice (two Solin instances). |
-| Browser: TLS error / `SSL_ERROR_INTERNAL_ERROR_ALERT` on a hall address | No certificate. The hall was not connected the first time someone visited, or ACME failed. Check `docker compose logs caddy` (look for `tls.obtain`, `ask`) and ask's `caddy-ask ... deny`. Ports 80 and 443 must be reachable from the internet for ACME. |
-| Hall address shows "not connected right now" | The tunnel is down. Check frpc on the hall and `docker compose logs frps`. |
+| Browser: TLS error / `SSL_ERROR_INTERNAL_ERROR_ALERT` | No certificate for `HUB_DOMAIN` yet: ACME failed. Check `docker compose logs caddy` (look for `tls.obtain`). DNS must point at the VPS, and ports 80 and 443 must be reachable from the internet. |
+| A meeting link shows "no such meeting" | The hall's Solin has not registered the code: Solin shows why in the meeting panel. Check `docker compose logs ask` for `codes for hall=...`. |
+| A meeting link keeps showing "has not opened yet" | The hall's tunnel is down: the meeting is not open in Solin, or frpc cannot connect. Check `docker compose logs frps`. |
 | WebSockets drop at regular intervals | Make sure nobody added `transport.heartbeatTimeout` to frps.toml, and that halls use `type = "tcp"`. A Caddy reload keeps streams for 8 h; a Caddy restart drops them. |
 | TURN does not relay | UDP 3478 and the relay range must be open in **both** the cloud security group and the host firewall. On 1:1 NAT clouds set `PRIVATE_IP`. Check `docker compose logs coturn` for `relay-ip` and `401`/`403`. Remember: peers in private ranges are refused by design. |
 | Which halls are online? | `curl -u admin:$FRP_ADMIN_PASSWORD http://127.0.0.1:7500/api/proxy/tcp` on the VPS. |
@@ -204,11 +212,11 @@ Run the TURN check from **outside** the VPS.
 
 ```
 docker-compose.yml        the four services (host networking, log rotation)
-Caddyfile                 production global options (ACME e-mail, on-demand TLS gate) + import
-sites.caddy               routing shared by production and local: hub domain, *.hub → hall
+Caddyfile                 production global options (ACME e-mail, timeouts) + import
+sites.caddy               routing shared by production and local: /<code> → hall, the rest → ask
 frps.toml                 tunnel server (templated from hub.env by frps itself)
 turnserver.conf           coturn template; coturn-entrypoint.sh renders it from hub.env
-ask/                      control service (ask.py, Dockerfile)
+ask/                      control service (ask.py, landing.html, Dockerfile): code registry, routing, landing page
 hub.env.example           all settings, documented
 halls.json.example        hall registry format
 hall/frpc.toml.template   what Solin writes on the hall PC

@@ -31,7 +31,7 @@ NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 def main() -> int:
     here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("name", help="hall name = subdomain, e.g. hall-abc123")
+    ap.add_argument("name", help="hall name (identifies the hall to the hub; not shown to attendees), e.g. hall-abc123")
     ap.add_argument("--halls", default=os.path.join(here, "..", "halls.json"))
     ap.add_argument("--key", help="use this key instead of generating one")
     ap.add_argument("--note", default="")

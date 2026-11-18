@@ -37,7 +37,9 @@ body::before {
     radial-gradient(1px 1px at 35% 88%, #fff, transparent), radial-gradient(1px 1px at 76% 92%, #fff, transparent);
 }
 header, main, footer { position: relative; }
-header { display: flex; align-items: center; gap: 10px; padding: 20px 24px; }
+header { display: flex; padding: 20px 24px; }
+.brand { display: inline-flex; align-items: center; gap: 10px; color: var(--text); text-decoration: none; border-radius: 8px; }
+.brand:hover span { color: #fff; }
 header img { width: 28px; height: 28px; border-radius: 7px; }
 header span { font-weight: 600; letter-spacing: -0.01em; }
 main { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -68,18 +70,27 @@ button:disabled { opacity: .6; cursor: progress; }
 button svg { width: 18px; height: 18px; }
 .message { min-height: 1.5em; font-size: .9rem; color: var(--error); }
 .message.notice { color: #fbbf24; }
+.waiting { display: flex; flex-direction: column; align-items: center; gap: 14px; max-width: 26rem; }
+.waiting[hidden] { display: none; }
+.waiting .muted { color: var(--muted); font-weight: 300; font-size: .9rem; }
+.countdown { font: 500 1.15rem 'JetBrains Mono', monospace; color: var(--accent-hi); }
+.pulse { width: 14px; height: 14px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 0 var(--accent-glow);
+         animation: pulse 2s infinite; }
+@keyframes pulse { 70% { box-shadow: 0 0 0 18px rgba(59,130,246,0); } 100% { box-shadow: 0 0 0 0 rgba(59,130,246,0); } }
 .hint { margin-top: 28px; color: var(--muted); font-size: .85rem; max-width: 24rem; font-weight: 300; }
 footer { padding: 20px; text-align: center; font-size: .8rem; color: #4d5561; }
 footer a { color: var(--muted); text-decoration: none; border-bottom: 1px solid var(--border-hi); }
 footer a:hover { color: var(--text); }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
-@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 </style>
 </head>
-<body data-message="{{MESSAGE}}" data-code="{{CODE}}">
+<body data-message="{{MESSAGE}}" data-code="{{CODE}}" data-starts="{{STARTS}}">
 <header>
-  <img alt="" src="data:image/png;base64,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" width="28" height="28">
-  <span>Solin</span>
+  <a class="brand" href="https://solin.run/">
+    <img alt="" src="data:image/png;base64,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" width="28" height="28">
+    <span>Solin</span>
+  </a>
 </header>
 <main>
   <p class="eyebrow" data-t="eyebrow">Solin Meetings</p>
@@ -94,6 +105,11 @@ footer a:hover { color: var(--text); }
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
     </button>
   </form>
+  <div id="waiting" class="waiting" hidden>
+    <div class="pulse" aria-hidden="true"></div>
+    <p id="countdown" class="countdown"></p>
+    <p class="muted" data-t="waitingHint">Keep this page open: it opens the meeting by itself as soon as it starts.</p>
+  </div>
   <p class="hint" data-t="hint">The code has 6 letters and numbers, as in meet.solin.run/abc234.</p>
 </main>
 <footer><a href="https://solin.run/" data-t="about">About Solin</a></footer>
@@ -105,15 +121,27 @@ footer a:hover { color: var(--text); }
     en: { eyebrow: 'Solin Meetings', title: 'Join a meeting', lead: 'Enter the meeting code you received from your congregation.',
           codeLabel: 'Meeting code', join: 'Join', hint: 'The code has 6 letters and numbers, as in meet.solin.run/abc234.',
           about: 'About Solin', empty: 'Type the meeting code.', invalid: 'That is not a meeting code. Check it and try again.',
-          notfound: 'No meeting is open with code {code} right now. Check the code, or try again when the meeting starts.' },
+          notfound: 'There is no meeting with code {code}. Check the code and try again.',
+          retired: 'The link with code {code} is no longer valid. Ask your congregation for the new one.',
+          waitingTitle: 'The meeting has not opened yet', waitingLead: 'Meeting {code}',
+          waitingHint: 'Keep this page open: it opens the meeting by itself as soon as it starts.',
+          startsIn: 'Starts in {time}', startsAt: 'Starts {time}', soon: 'Starting soon' },
     pt: { eyebrow: 'Reuniões Solin', title: 'Entrar numa reunião', lead: 'Digite o código da reunião que você recebeu da sua congregação.',
           codeLabel: 'Código da reunião', join: 'Entrar', hint: 'O código tem 6 letras e números, como em meet.solin.run/abc234.',
           about: 'Sobre o Solin', empty: 'Digite o código da reunião.', invalid: 'Esse não é um código de reunião. Confira e tente de novo.',
-          notfound: 'Nenhuma reunião está aberta com o código {code} agora. Confira o código ou tente de novo quando a reunião começar.' },
+          notfound: 'Não existe reunião com o código {code}. Confira o código e tente de novo.',
+          retired: 'O link com o código {code} não é mais válido. Peça o novo à sua congregação.',
+          waitingTitle: 'A reunião ainda não foi aberta', waitingLead: 'Reunião {code}',
+          waitingHint: 'Deixe esta página aberta: ela entra na reunião sozinha assim que começar.',
+          startsIn: 'Começa em {time}', startsAt: 'Começa {time}', soon: 'Começa em instantes' },
     es: { eyebrow: 'Reuniones Solin', title: 'Entrar a una reunión', lead: 'Escriba el código de la reunión que recibió de su congregación.',
           codeLabel: 'Código de la reunión', join: 'Entrar', hint: 'El código tiene 6 letras y números, como en meet.solin.run/abc234.',
           about: 'Acerca de Solin', empty: 'Escriba el código de la reunión.', invalid: 'Ese no es un código de reunión. Revíselo e inténtelo de nuevo.',
-          notfound: 'No hay ninguna reunión abierta con el código {code} ahora. Revise el código o inténtelo de nuevo cuando empiece la reunión.' },
+          notfound: 'No existe ninguna reunión con el código {code}. Revise el código e inténtelo de nuevo.',
+          retired: 'El enlace con el código {code} ya no es válido. Pida el nuevo a su congregación.',
+          waitingTitle: 'La reunión aún no se ha abierto', waitingLead: 'Reunión {code}',
+          waitingHint: 'Deje esta página abierta: entra en la reunión sola en cuanto empiece.',
+          startsIn: 'Empieza en {time}', startsAt: 'Empieza {time}', soon: 'Empieza en breve' },
   };
   const lang = (navigator.languages || [navigator.language || 'en']).map(l => l.slice(0, 2).toLowerCase()).find(l => TEXT[l]) || 'en';
   const T = TEXT[lang];
@@ -128,10 +156,34 @@ footer a:hover { color: var(--text); }
   const normalize = s => s.toLowerCase().replace(/^.*\//, '').replace(/[\s-]/g, '');
   const show = (key, code) => {
     message.textContent = key ? T[key].replace('{code}', code || '') : '';
-    message.className = key === 'notfound' ? 'message notice' : 'message';
-    input.setAttribute('aria-invalid', key && key !== 'notfound' ? 'true' : 'false');
+    const notice = key === 'notfound' || key === 'retired';
+    message.className = notice ? 'message notice' : 'message';
+    input.setAttribute('aria-invalid', key && !notice ? 'true' : 'false');
   };
-  show(document.body.dataset.message, document.body.dataset.code);
+  const { message: state, code: givenCode, starts } = document.body.dataset;
+  if (state === 'waiting') {
+    // A registered meeting whose hall has not opened it yet: count down, and reload until it opens.
+    document.querySelector('h1').textContent = T.waitingTitle;
+    document.querySelector('.lead').textContent = T.waitingLead.replace('{code}', givenCode);
+    form.hidden = true;
+    document.querySelector('.hint').hidden = true;
+    document.getElementById('waiting').hidden = false;
+    const countdown = document.getElementById('countdown');
+    const startsAt = starts ? new Date(starts) : null;
+    const tick = () => {
+      if (!startsAt || isNaN(startsAt)) { countdown.textContent = ''; return; }
+      const minutes = Math.ceil((startsAt - Date.now()) / 60000);
+      if (minutes <= 0) countdown.textContent = T.soon;
+      else if (minutes <= 60) countdown.textContent = T.startsIn.replace('{time}', minutes + ' min');
+      else countdown.textContent = T.startsAt.replace('{time}', startsAt.toLocaleString(lang,
+        { weekday: 'long', hour: '2-digit', minute: '2-digit' }));
+    };
+    tick();
+    setInterval(tick, 15000);
+    setInterval(() => location.reload(), 15000);
+  } else {
+    show(state, givenCode);
+  }
 
   input.addEventListener('input', () => show(''));
   form.addEventListener('submit', e => {

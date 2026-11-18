@@ -49,6 +49,8 @@ services:
     # file) are picked up without a restart.
     volumes:
       - ./:/hub:ro
+      # The meeting-code registry (codes.json), kept across deploys.
+      - ask-data:/data
     logging: *logging
 
   coturn:
@@ -63,5 +65,6 @@ services:
     logging: *logging
 
 volumes:
+  ask-data:
   caddy-data:
   caddy-config:

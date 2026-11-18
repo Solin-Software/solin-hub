@@ -80,7 +80,8 @@ async def hall_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, 
                     break
                 k, v = h.decode("latin-1").split(":", 1)
                 headers[k.strip().lower()] = v.strip()
-            if headers.get("upgrade", "").lower() == "websocket" and target.startswith("/ws"):
+            # Solin's meeting WebSocket is /<code>/ws.
+            if headers.get("upgrade", "").lower() == "websocket" and target.split("?", 1)[0].endswith("/ws"):
                 accept = base64.b64encode(hashlib.sha1((headers["sec-websocket-key"] + WS_GUID).encode()).digest())
                 writer.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                              b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n")
@@ -176,6 +177,9 @@ async def run_http(args: argparse.Namespace) -> int:
     print(f"{status} {payload.decode('utf-8', 'replace').strip()[:400]}")
     if args.expect and status != int(args.expect):
         print(f"FAIL: expected HTTP {args.expect}", file=sys.stderr)
+        return 1
+    if args.contains and args.contains.encode() not in payload:
+        print(f"FAIL: the body does not contain {args.contains!r}", file=sys.stderr)
         return 1
     return 0
 
@@ -381,6 +385,7 @@ def main() -> int:
         if name == "http":
             p.add_argument("--post")
             p.add_argument("--expect", help="HTTP status, or 'tls-refused'")
+            p.add_argument("--contains", help="text the response body must contain")
         else:
             p.add_argument("--idle", type=float, default=95)
     p = sub.add_parser("turn")

@@ -55,10 +55,8 @@ What else to look for:
 |---|---|---|
 | `hub.example.org` | A | the VPS IPv4 |
 | `hub.example.org` | AAAA | the VPS IPv6 |
-| `*.hub.example.org` | A | the VPS IPv4 |
-| `*.hub.example.org` | AAAA | the VPS IPv6 |
 
-`hub.example.org` becomes `HUB_DOMAIN`. Halls are served at `https://<hall>.hub.example.org/`. Certificates come from Let's Encrypt automatically.
+`hub.example.org` becomes `HUB_DOMAIN`. Meetings are served at `https://hub.example.org/<code>`. The certificate comes from Let's Encrypt automatically.
 
 **Without a domain (tests, small setups).** Use sslip.io: `HUB_DOMAIN=203-0-113-10.sslip.io` for a VPS at `203.0.113.10`. No DNS setup is needed. The addresses change if the IP changes; see the README for the caveats.
 
@@ -219,9 +217,9 @@ It prints:
 
 In Solin on the hall's computer, paste the connection code into **Settings → Integrations → Hosted meetings → Hub connection code**.
 
-The hall is then online at `https://hall-abc123.<HUB_DOMAIN>/` whenever Solin is running. The first visit takes a few seconds while its certificate is issued.
+Solin then registers its meeting codes with the hub, and each meeting is at `https://<HUB_DOMAIN>/<code>` while Solin has it open.
 
-- **Hall names** are part of the public address. Use something not easy to guess, like `hall-abc123`.
+- **Hall names** are not shown to attendees; they only identify the hall to the hub.
 - **Rotating a key:** run the same command again. The hall keeps its port; give it the new connection code.
 - **Removing a hall:** delete its entry from `halls.json`. The change is picked up live; no restart is needed.
 
@@ -280,6 +278,6 @@ curl -s -u admin:<FRP_ADMIN_PASSWORD> http://127.0.0.1:7500/api/proxy/tcp   # co
   docker run --rm -v solin-hub_caddy-data:/data -v "$PWD":/out alpine tar -czf /out/caddy-data.tgz -C /data .
   ```
   Store the backup off the VPS; it contains secrets.
-- **Moving to a new VPS:** prepare the new server (step 3) and restore `hub.env` and `halls.json`. Update `PUBLIC_IP` and `PRIVATE_IP`/`PUBLIC_IP6`, point DNS at the new address, then deploy. Halls keep their connection codes as long as `HUB_DOMAIN` and the secrets stay the same.
+- **Moving to a new VPS:** prepare the new server (step 3) and restore `hub.env`, `halls.json` and the code registry (`docker compose cp ask:/data/codes.json .` on the old server, `cp` it back into the new `ask` container); without the registry, halls register their codes again the next time Solin runs. Update `PUBLIC_IP` and `PRIVATE_IP`/`PUBLIC_IP6`, point DNS at the new address, then deploy. Halls keep their connection codes as long as `HUB_DOMAIN` and the secrets stay the same.
 - **Operating system updates:** `unattended-upgrades` installs security fixes. Schedule reboots outside meeting times; Docker restarts the hub on boot.
 - **Troubleshooting:** see the table in [README.md](README.md#troubleshooting).
