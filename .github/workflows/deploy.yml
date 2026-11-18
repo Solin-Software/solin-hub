@@ -1,7 +1,7 @@
 name: Deploy
 
 # Ships main to the hub VPS after CI passes. Inactive until the "production" environment is set up
-# (see INSTALL.md, "Continuous deployment"): without the HUB_HOST variable the deploy job is skipped.
+# (see INSTALL.md, "Continuous deployment"): without the HUB_HOST variable the deploy job ships nothing.
 #
 # Environment "production":
 #   variables  HUB_HOST (required), HUB_SSH_USER (default solin-hub), HUB_SSH_PORT (default 22),
@@ -43,11 +43,25 @@ jobs:
     environment:
       name: production
       url: ${{ vars.HUB_DOMAIN && format('https://{0}/', vars.HUB_DOMAIN) || '' }}
-    if: ${{ vars.HUB_HOST != '' }}
+    # Environment variables are not visible to a job-level `if`, so the "not configured yet" check
+    # is a step: without HUB_HOST the job ends green and ships nothing.
     steps:
+      - name: Check that the environment is configured
+        id: configured
+        env:
+          HUB_HOST: ${{ vars.HUB_HOST }}
+        run: |
+          if [ -n "$HUB_HOST" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Deploy skipped: set the HUB_HOST variable in the production environment (INSTALL.md, step 8)."
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.configured.outputs.ok == 'true'
 
       - name: Set up SSH
+        if: steps.configured.outputs.ok == 'true'
         env:
           HUB_SSH_KEY: ${{ secrets.HUB_SSH_KEY }}
           HUB_SSH_KNOWN_HOSTS: ${{ secrets.HUB_SSH_KNOWN_HOSTS }}
@@ -62,6 +76,7 @@ jobs:
           chmod 600 ~/.ssh/hub_deploy ~/.ssh/hub_known_hosts
 
       - name: Ship and apply
+        if: steps.configured.outputs.ok == 'true'
         env:
           HUB_HOST: ${{ vars.HUB_HOST }}
           HUB_SSH_USER: ${{ vars.HUB_SSH_USER || 'solin-hub' }}
@@ -77,7 +92,7 @@ jobs:
           scripts/deploy.sh $FORCE $DRY_RUN
 
       - name: Public health check
-        if: ${{ vars.HUB_DOMAIN != '' && !inputs.dry_run }}
+        if: ${{ steps.configured.outputs.ok == 'true' && vars.HUB_DOMAIN != '' && !inputs.dry_run }}
         env:
           HUB_DOMAIN: ${{ vars.HUB_DOMAIN }}
         run: |

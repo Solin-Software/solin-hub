@@ -231,7 +231,7 @@ Both workflows are in `.github/workflows/`:
 - **CI** runs on pull requests and branches: lint, unit tests, configuration validation, and an end-to-end smoke test of a complete local hub.
 - **Deploy** runs on every push to `main`. It runs CI first, then ships `main` to the VPS with `scripts/deploy.sh`, applies it, and checks `https://<HUB_DOMAIN>/healthz`.
 
-**Until it is configured, the deploy job is skipped.** It only runs when the `HUB_HOST` variable exists.
+**Until it is configured, the deploy job ships nothing.** It succeeds with a notice until the `HUB_HOST` variable exists.
 
 To turn it on, go to the repository's **Settings → Environments → New environment** and create `production`:
 
