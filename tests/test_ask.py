@@ -64,14 +64,17 @@ class CodeRegistryTests(AskTestCase):
 
     def test_sync_updates_only_owned_codes(self) -> None:
         mine, theirs = self.new_code("mine"), self.new_code("theirs")
-        rejected = self.ask.codes.sync([(mine, "mine", "2026-11-22T09:00:00-03:00", False),
-                                        (theirs, "mine", "", False), ("zzzzzz", "mine", "", True)], 200.0)
+        rejected = self.ask.codes.sync([(mine, "mine", "2026-11-22T09:00:00-03:00", False, "Central", "weekend"),
+                                        (theirs, "mine", "", False, "", ""),
+                                        ("zzzzzz", "mine", "", True, "", "")], 200.0)
         self.assertEqual(rejected, [theirs, "zzzzzz"])
         self.assertEqual(self.ask.codes.lookup(mine)["starts_at"], "2026-11-22T09:00:00-03:00")
         self.assertFalse(self.ask.codes.lookup(mine)["active"])
+        self.assertEqual(self.ask.codes.lookup(mine)["title"], "Central")
+        self.assertEqual(self.ask.codes.lookup(mine)["kind"], "weekend")
         self.assertTrue(self.ask.codes.lookup(theirs)["active"])
         # The owner can bring a code back.
-        self.ask.codes.sync([(mine, "mine", "", True)], 300.0)
+        self.ask.codes.sync([(mine, "mine", "", True, "", "")], 300.0)
         self.assertTrue(self.ask.codes.lookup(mine)["active"])
         # Saved, and read back by a fresh registry.
         self.assertTrue(self.ask.Codes(str(self.codes_path)).owns(mine, "mine"))
@@ -80,7 +83,7 @@ class CodeRegistryTests(AskTestCase):
         old = self.new_code("old", now=100.0)
         kept = self.new_code("kept", now=100.0)
         later = 100.0 + self.ask.FORGET_AFTER_S - 10
-        self.ask.codes.sync([(kept, "kept", "", True)], later)
+        self.ask.codes.sync([(kept, "kept", "", True, "", "")], later)
         self.ask.codes.sync([], 100.0 + self.ask.FORGET_AFTER_S + 1)
         self.assertIsNone(self.ask.codes.lookup(old))
         self.assertIsNotNone(self.ask.codes.lookup(kept))
@@ -88,7 +91,11 @@ class CodeRegistryTests(AskTestCase):
     def test_parse_sync(self) -> None:
         parse = self.ask.parse_sync
         self.assertEqual(parse({"codes": [{"code": "k7m4p2", "secret": "s", "startsAt": "x", "active": False}]}),
-                         [("k7m4p2", "s", "x", False)])
+                         [("k7m4p2", "s", "x", False, "", "")])
+        # Names are tidied and capped; an unknown kind is dropped (the page shows only known ones).
+        named = parse({"codes": [{"code": "k7m4p2", "secret": "s", "title": "  Central \n  Hall " + "x" * 100,
+                                  "kind": "<b>"}]})
+        self.assertEqual(named[0][4:], ("Central Hall " + "x" * 67, ""))
         self.assertEqual(parse({"codes": []}), [])
         for bad in ({}, {"codes": "k7m4p2"}, {"codes": [{"code": "abc123", "secret": "s"}]},
                     {"codes": [{"code": "k7m4p2"}]},
@@ -155,10 +162,13 @@ class HttpTests(AskTestCase):
         return self.get("/internal/route", {"X-Forwarded-Uri": uri})
 
     def test_create_and_sync_codes(self) -> None:
-        status, body = self.post("/api/codes", {"owner": digest("mine"), "startsAt": "2026-11-20T19:30:00-03:00"})
+        status, body = self.post("/api/codes", {"owner": digest("mine"), "startsAt": "2026-11-20T19:30:00-03:00",
+                                                "title": "Central", "kind": "weekend"})
         self.assertEqual(status, 201)
         code = body["code"]
         self.assertTrue(self.ask.codes.owns(code, "mine"))
+        self.assertEqual(self.ask.codes.lookup(code)["title"], "Central")
+        self.assertEqual(self.ask.codes.lookup(code)["kind"], "weekend")
         self.assertEqual(self.post("/api/codes", {"owner": "not-a-hash"})[0], 400)
         self.assertEqual(self.post("/api/codes", b"{not json")[0], 400)
         status, body = self.post("/api/codes/sync", {"codes": [
@@ -188,7 +198,7 @@ class HttpTests(AskTestCase):
         expected = base64.b64encode(hmac.new(b"turn-secret", body["username"].encode(), hashlib.sha1).digest())
         self.assertEqual(body["credential"], expected.decode())
         self.assertEqual(self.post("/api/turn", {"code": code, "secret": "wrong"})[0], 403)
-        self.ask.codes.sync([(code, "mine", "", False)], 200.0)
+        self.ask.codes.sync([(code, "mine", "", False, "", "")], 200.0)
         self.assertEqual(self.post("/api/turn", {"code": code, "secret": "mine"})[0], 403)
 
     def test_hub_info(self) -> None:
@@ -197,8 +207,9 @@ class HttpTests(AskTestCase):
     def test_route(self) -> None:
         live = self.new_code("a")
         waiting = self.new_code("b", "2026-11-20T19:30:00-03:00")
+        self.ask.codes.sync([(waiting, "b", "2026-11-20T19:30:00-03:00", True, 'Central "<Hall>"', "midweek")], 100.0)
         retired = self.new_code("c")
-        self.ask.codes.sync([(retired, "c", "", False)], 100.0)
+        self.ask.codes.sync([(retired, "c", "", False, "", "")], 100.0)
         self.open_tunnels = {live: 20004}
         for uri in (f"/{live}", f"/{live}/", f"/{live}/m", f"/{live}/ws?x=1"):
             status, headers, _ = self.route(uri)
@@ -207,6 +218,7 @@ class HttpTests(AskTestCase):
         self.assertEqual((status, headers.get("Retry-After")), (503, "10"))
         expected = f'data-message="waiting" data-code="{waiting}" data-starts="2026-11-20T19:30:00-03:00"'
         self.assertIn(expected.encode(), body)
+        self.assertIn(b'data-title="Central &quot;&lt;Hall&gt;&quot;" data-kind="midweek"', body)
         self.assertNotIn("X-Solin-Tunnel-Port", headers)
         status, _, body = self.route(f"/{retired}")
         self.assertEqual(status, 410)

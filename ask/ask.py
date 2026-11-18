@@ -20,12 +20,14 @@ Public endpoints (served on https://<HUB_DOMAIN>/):
   GET  /status              tiny status page
   GET  /healthz             "ok"
   GET  /api/hub             what Solin needs for tunnels: {"frpPort", "frpToken"}
-  POST /api/codes           {"owner": "<sha256 hex of a new secret>", "startsAt": "<ISO>" | ""}
+  POST /api/codes           {"owner": "<sha256 hex of a new secret>", "startsAt": "<ISO>" | "",
+                             "title": "<congregation / hall name>", "kind": "midweek" | "weekend" | ...}
                             -> 201 {"code": "k7m4p2"}  (rate-limited per client address)
-  POST /api/codes/sync      {"codes": [{"code", "secret", "startsAt", "active"}]}
+  POST /api/codes/sync      {"codes": [{"code", "secret", "startsAt", "active", "title", "kind"}]}
                             -> 200 {"rejected": [codes whose secret is wrong or that are unknown]}
-                            Sets each code's start time (the waiting page's countdown) and whether
-                            it is active; an inactive code's link says "no longer valid".
+                            Sets each code's start time (the waiting page's countdown), the name
+                            and kind of meeting the waiting page shows, and whether it is active;
+                            an inactive code's link says "no longer valid".
   POST /api/turn            {"code", "secret"} -> {"urls", "username", "credential", "ttl"}
                             time-limited TURN credentials for that code's meeting
 """
@@ -75,6 +77,8 @@ OWNER = re.compile(r"^[0-9a-f]{64}$")
 # A code nobody has synced (or that was retired) this long is forgotten and may be issued again.
 FORGET_AFTER_S = 400 * 24 * 3600
 MAX_SYNC_CODES = 300
+MAX_TITLE = 80
+KINDS = ("", "midweek", "weekend", "extra", "unscheduled")   # the waiting page names each in the visitor's language
 MAX_BODY = 256 * 1024
 # New codes per client address: a congregation needs ~10 a month; this only stops floods.
 CREATE_LIMIT = (120, 3600.0)
@@ -88,7 +92,7 @@ def digest(secret: str) -> str:
 
 
 class Codes:
-    """The code registry: {code: {"owner", "starts_at", "active", "created_at", "seen_at"}}.
+    """The code registry: {code: {"owner", "starts_at", "title", "kind", "active", "created_at", "seen_at"}}.
 
     ``owner`` is the sha256 of the code's secret. Saved atomically after every change.
     """
@@ -104,6 +108,7 @@ class Codes:
                 if MEETING_CODE.match(str(code)) and OWNER.match(str(e.get("owner", ""))):
                     self._codes[str(code)] = {
                         "owner": str(e["owner"]), "starts_at": str(e.get("starts_at") or ""),
+                        "title": clean_title(e.get("title")), "kind": clean_kind(e.get("kind")),
                         "active": bool(e.get("active", True)), "created_at": float(e.get("created_at") or 0),
                         "seen_at": float(e.get("seen_at") or 0)}
         except FileNotFoundError:
@@ -120,29 +125,33 @@ class Codes:
         entry = self.lookup(code)
         return bool(entry and secret and hmac.compare_digest(entry["owner"], digest(secret)))
 
-    def create(self, owner: str, starts_at: str, now: float) -> str:
+    def create(self, owner: str, starts_at: str, now: float, title: str = "", kind: str = "") -> str:
         with self._lock:
             self._forget(now)
             while True:
                 code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(6))
                 if code not in self._codes:
                     break
-            self._codes[code] = {"owner": owner, "starts_at": starts_at, "active": True,
+            self._codes[code] = {"owner": owner, "starts_at": starts_at, "title": title, "kind": kind,
+                                 "active": True,
                                  "created_at": now, "seen_at": now}
             self._save()
             return code
 
-    def sync(self, items: list[tuple[str, str, str, bool]], now: float) -> list[str]:
-        """items: (code, secret, starts_at, active). Returns the codes refused (unknown or wrong secret)."""
+    def sync(self, items: list[tuple[str, str, str, bool, str, str]], now: float) -> list[str]:
+        """items: (code, secret, starts_at, active, title, kind).
+
+        Returns the codes refused (unknown or wrong secret).
+        """
 
         rejected: list[str] = []
         with self._lock:
-            for code, secret, starts_at, active in items:
+            for code, secret, starts_at, active, title, kind in items:
                 entry = self._codes.get(code)
                 if entry is None or not hmac.compare_digest(entry["owner"], digest(secret)):
                     rejected.append(code)
                     continue
-                entry.update(starts_at=starts_at, active=active, seen_at=now)
+                entry.update(starts_at=starts_at, title=title, kind=kind, active=active, seen_at=now)
             self._forget(now)
             self._save()
         return rejected
@@ -268,7 +277,15 @@ def turn_credentials(code: str, now: float) -> dict:
             "username": username, "credential": credential, "ttl": TURN_TTL_S}
 
 
-def parse_sync(body: dict) -> list[tuple[str, str, str, bool]] | None:
+def clean_title(value: object) -> str:
+    return " ".join(str(value or "").split())[:MAX_TITLE]
+
+
+def clean_kind(value: object) -> str:
+    return str(value) if value in KINDS else ""
+
+
+def parse_sync(body: dict) -> list[tuple[str, str, str, bool, str, str]] | None:
     items = body.get("codes")
     if not isinstance(items, list) or len(items) > MAX_SYNC_CODES:
         return None
@@ -279,7 +296,8 @@ def parse_sync(body: dict) -> list[tuple[str, str, str, bool]] | None:
         secret, starts_at = str(item.get("secret") or ""), str(item.get("startsAt") or "")
         if not 0 < len(secret) <= 200 or len(starts_at) > 40:
             return None
-        parsed.append((str(item["code"]), secret, starts_at, bool(item.get("active", True))))
+        parsed.append((str(item["code"]), secret, starts_at, bool(item.get("active", True)),
+                       clean_title(item.get("title")), clean_kind(item.get("kind"))))
     return parsed
 
 
@@ -300,11 +318,14 @@ def normalize_code(text: str) -> str:
     return re.sub(r"[\s-]", "", text.strip().lower().rsplit("/", 1)[-1])
 
 
-def landing(message: str = "", code: str = "", starts_at: str = "") -> bytes:
+def landing(message: str = "", code: str = "", starts_at: str = "", title: str = "", kind: str = "") -> bytes:
     """message: "" | "invalid" | "notfound" | "retired" | "waiting" (shown in the visitor's language)."""
 
-    return (LANDING.replace("{{MESSAGE}}", html.escape(message)).replace("{{CODE}}", html.escape(code))
-            .replace("{{STARTS}}", html.escape(starts_at)).encode("utf-8"))
+    fields = {"MESSAGE": message, "CODE": code, "STARTS": starts_at, "TITLE": title, "KIND": kind}
+    page = LANDING
+    for name, value in fields.items():
+        page = page.replace("{{" + name + "}}", html.escape(value))
+    return page.encode("utf-8")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -383,7 +404,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(410, landing("retired", code), HTML)
         elif port is None:
             # The owner's Solin opens the tunnel when the meeting opens; the page polls until then.
-            self._send(503, landing("waiting", code, entry["starts_at"]), HTML, {"Retry-After": "10"})
+            self._send(503, landing("waiting", code, entry["starts_at"], entry["title"], entry["kind"]), HTML,
+                       {"Retry-After": "10"})
         else:
             self._send(200, headers={PORT_HEADER: str(port)})
 
@@ -412,13 +434,14 @@ class Handler(BaseHTTPRequestHandler):
             elif not create_limit.allow(self._client(), time.monotonic()):
                 self._json(429, {"error": "too many new codes from this address; try again later"})
             else:
-                code = codes.create(owner, starts_at, time.time())
+                code = codes.create(owner, starts_at, time.time(), clean_title(body.get("title")),
+                                    clean_kind(body.get("kind")))
                 log.info("code created: %s", code)
                 self._json(201, {"code": code})
         elif url.path == "/api/codes/sync":
             items = parse_sync(body)
             if items is None:
-                self._json(400, {"error": "expected {codes: [{code, secret, startsAt, active}]}"})
+                self._json(400, {"error": "expected {codes: [{code, secret, startsAt, active, title, kind}]}"})
             else:
                 self._json(200, {"rejected": codes.sync(items, time.time())})
         else:
