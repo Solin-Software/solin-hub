@@ -4,17 +4,17 @@
     python3 scripts/apply.py [--dry-run] [--force]
 
 Used by the deploy workflow (through scripts/deploy.sh) and by hand. It:
-  1. checks hub.env (present, no placeholder secrets) and creates an empty halls.json if needed;
+  1. checks hub.env (present, no placeholder secrets);
   2. validates the compose file, the Caddyfile and frps.toml with the pinned images;
   3. works out which services changed since the last apply (compose definition + config files);
-  4. refuses to restart the tunnel server or the TURN relay while halls are connected, unless
+  4. refuses to restart the tunnel server or the TURN relay while meetings are open, unless
      --force: either restart cuts every meeting that is running;
   5. builds and (re)starts what changed; a Caddyfile-only change is a live `caddy reload`, which
      keeps meetings' WebSockets open;
   6. waits until every service is running and the ask service answers, then records the new state
      in .deployed/state.json.
 
-Exit codes: 0 applied (or nothing to do), 1 failed, 2 bad configuration, 3 refused (halls online).
+Exit codes: 0 applied (or nothing to do), 1 failed, 2 bad configuration, 3 refused (meetings open).
 Standard library only; needs docker with the compose plugin.
 """
 
@@ -34,7 +34,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent.parent
 STATE_DIR = ".deployed"
 SERVICES = ("ask", "frps", "coturn", "caddy")
-# Restarting these drops every hall's tunnel / every relayed attendee.
+# Restarting these drops every meeting's tunnel / every relayed attendee.
 DISRUPTIVE = frozenset({"frps", "coturn"})
 # Files each service reads at runtime (bind mounts). Changes to them are invisible to compose.
 SERVICE_FILES = {
@@ -45,7 +45,7 @@ SERVICE_FILES = {
 }
 REQUIRED_ENV = (
     "HUB_DOMAIN", "ACME_EMAIL", "PUBLIC_IP", "FRP_BIND_PORT", "FRP_TOKEN", "FRP_ADMIN_PORT",
-    "FRP_ADMIN_PASSWORD", "HALL_PORT_MIN", "HALL_PORT_MAX", "ASK_PORT", "TURN_SECRET",
+    "FRP_ADMIN_PASSWORD", "TUNNEL_PORT_MIN", "TUNNEL_PORT_MAX", "ASK_PORT", "TURN_SECRET",
 )
 SECRETS = ("FRP_TOKEN", "FRP_ADMIN_PASSWORD", "TURN_SECRET")
 HEALTH_TIMEOUT_S = 90
@@ -131,8 +131,8 @@ def disruptive(steps: dict[str, list[str]], running: set[str]) -> list[str]:
     return hits
 
 
-def halls_online(env: dict[str, str]) -> int:
-    """Hall tunnels frps reports online; 0 when frps is not answering (then nothing is connected)."""
+def meetings_open(env: dict[str, str]) -> int:
+    """Meeting tunnels frps reports online; 0 when frps is not answering (then nothing is connected)."""
     url = f"http://127.0.0.1:{env.get('FRP_ADMIN_PORT', '7500')}/api/proxy/tcp"
     auth = base64.b64encode(f"admin:{env.get('FRP_ADMIN_PASSWORD', '')}".encode()).decode()
     request = urllib.request.Request(url, headers={"Authorization": "Basic " + auth})
@@ -193,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--dry-run", action="store_true", help="validate and print the plan only")
     parser.add_argument("--force", action="store_true",
-                        help="restart the tunnel server / TURN relay even while halls are connected")
+                        help="restart the tunnel server / TURN relay even while meetings are open")
     parser.add_argument("--root", type=Path, default=HERE, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     sys.stdout.reconfigure(line_buffering=True)  # keep our lines in order with docker's output
@@ -209,11 +209,6 @@ def main(argv: list[str] | None = None) -> int:
     if problems:
         print("error: hub.env is not ready:\n  - " + "\n  - ".join(problems), file=sys.stderr)
         return 2
-    halls = root / "halls.json"
-    if not halls.exists() and not args.dry_run:
-        halls.write_text('{"halls": {}}\n', encoding="utf-8")
-        halls.chmod(0o644)  # read by the ask container's unprivileged user
-        print("created an empty halls.json (register halls with scripts/add_hall.py)")
 
     try:
         print("== validating the configuration")
@@ -235,14 +230,14 @@ def main(argv: list[str] | None = None) -> int:
 
     cutting = disruptive(steps, running)
     if cutting:
-        connected = halls_online(env)
+        connected = meetings_open(env)
         if connected and not args.force:
-            print(f"refused: {connected} hall(s) are connected right now, and restarting "
+            print(f"refused: {connected} meeting(s) are open right now, and restarting "
                   f"{', '.join(cutting)} would cut their meetings. Deploy again when no meeting is "
                   "running, or pass --force (deploy workflow: input 'force').", file=sys.stderr)
             return 3
         if connected:
-            print(f"warning: --force: restarting {', '.join(cutting)} with {connected} hall(s) connected")
+            print(f"warning: --force: restarting {', '.join(cutting)} with {connected} meeting(s) open")
 
     if args.dry_run:
         print("dry run: nothing changed")

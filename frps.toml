@@ -1,9 +1,10 @@
-# frps: hall PCs (frpc) dial out to bindPort. Each hall publishes ONE raw TCP proxy (its meeting
-# web server); the hub's "ask" plugin checks the hall's key and pins the proxy to the hall's
-# registered port on 127.0.0.1, where only Caddy can reach it. Values come from hub.env.
+# frps: the Solin running a meeting (frpc) dials out to bindPort and publishes ONE raw TCP proxy,
+# its meeting web server, named after the meeting code. The hub's "ask" plugin checks the code's
+# secret and picks the proxy's port on 127.0.0.1, where only Caddy can reach it. Values come from
+# hub.env.
 bindPort = {{ .Envs.FRP_BIND_PORT }}
 proxyBindAddr = "127.0.0.1"
-allowPorts = [{ start = {{ .Envs.HALL_PORT_MIN }}, end = {{ .Envs.HALL_PORT_MAX }} }]
+allowPorts = [{ start = {{ .Envs.TUNNEL_PORT_MIN }}, end = {{ .Envs.TUNNEL_PORT_MAX }} }]
 maxPortsPerClient = 1
 
 auth.method = "token"
@@ -14,7 +15,7 @@ auth.token = "{{ .Envs.FRP_TOKEN }}"
 # tunnel each timeout period (seen in the S5 spike: all attendees reconnected every 90 s).
 transport.tcpMux = true
 
-# Admin API, used by the ask service to see which halls are online. Loopback only.
+# Admin API, used by the ask service to see which meetings are open (and on which port). Loopback only.
 webServer.addr = "127.0.0.1"
 webServer.port = {{ .Envs.FRP_ADMIN_PORT }}
 webServer.user = "admin"
@@ -23,10 +24,11 @@ webServer.password = "{{ .Envs.FRP_ADMIN_PASSWORD }}"
 log.to = "console"
 log.level = "info"
 
-# Per-hall authorization (halls.json): Login checks the hall name + key sent in frpc metadatas,
-# NewProxy additionally forces proxy name = hall name, type = tcp and remotePort = registered port.
+# Per-code authorization: NewProxy needs the code and its secret in frpc metadatas, and the proxy
+# named after the code (type tcp); the plugin picks remotePort. Login only needs FRP_TOKEN, which
+# the hub hands to every Solin (GET /api/hub): the code's secret is what protects a meeting.
 [[httpPlugins]]
-name = "solin-halls"
+name = "solin-codes"
 addr = "127.0.0.1:{{ .Envs.ASK_PORT }}"
 path = "/internal/frps-plugin"
-ops = ["Login", "NewProxy"]
+ops = ["NewProxy"]

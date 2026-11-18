@@ -1,8 +1,10 @@
-"""Unit tests for the ask service (ask/ask.py): hall registry, routing and the frps plugin."""
+"""Unit tests for the ask service (ask/ask.py): meeting codes, routing, TURN and the frps plugin."""
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
 import http.client
 import importlib.util
 import json
@@ -19,9 +21,10 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def load_ask(halls_file: str, codes_file: str):
-    env = {"HUB_DOMAIN": "Hub.Example.Test.", "FRP_ADMIN_PASSWORD": "pw", "HALLS_FILE": halls_file,
-           "CODES_FILE": codes_file, "HALL_PORT_MIN": "20000", "HALL_PORT_MAX": "20099"}
+def load_ask(codes_file: str):
+    env = {"HUB_DOMAIN": "Hub.Example.Test.", "FRP_ADMIN_PASSWORD": "pw", "FRP_TOKEN": "frp-token",
+           "CODES_FILE": codes_file, "TUNNEL_PORT_MIN": "20000", "TUNNEL_PORT_MAX": "20009",
+           "TURN_SECRET": "turn-secret"}
     with mock.patch.dict(os.environ, env):
         spec = importlib.util.spec_from_file_location("ask_under_test", ROOT / "ask" / "ask.py")
         module = importlib.util.module_from_spec(spec)
@@ -29,133 +32,100 @@ def load_ask(halls_file: str, codes_file: str):
     return module
 
 
-def digest(key: str) -> str:
-    return hashlib.sha256(key.encode()).hexdigest()
+def digest(secret: str) -> str:
+    return hashlib.sha256(secret.encode()).hexdigest()
 
 
 class AskTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
-        self.halls_path = Path(self.dir.name) / "halls.json"
-        self.write_halls({"hall-a": {"key_sha256": digest("key-a"), "port": 20001},
-                          "hall-b": {"key_sha256": digest("key-b"), "port": 20002}})
         self.codes_path = Path(self.dir.name) / "codes.json"
-        self.ask = load_ask(str(self.halls_path), str(self.codes_path))
-        self.online_names: set[str] = {"hall-a"}
-        patcher = mock.patch.object(self.ask.online, "names", side_effect=lambda: set(self.online_names))
+        self.ask = load_ask(str(self.codes_path))
+        self.open_tunnels: dict[str, int] = {}   # what frps reports: code -> port
+        patcher = mock.patch.object(self.ask.tunnels, "ports", side_effect=lambda: dict(self.open_tunnels))
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def write_halls(self, halls: dict) -> None:
-        tmp = self.halls_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"halls": halls}), encoding="utf-8")
-        os.replace(tmp, self.halls_path)
-        # Same-second rewrites of the same size would keep the cached stamp: bump mtime.
-        stamp = getattr(self, "_mtime", 1_000_000) + 10
-        self._mtime = stamp
-        os.utime(self.halls_path, (stamp, stamp))
-
-
-class HallRegistryTests(AskTestCase):
-    def test_keys_are_checked_against_the_hash(self) -> None:
-        self.assertIsNotNone(self.ask.halls.check_key("hall-a", "key-a"))
-        self.assertIsNone(self.ask.halls.check_key("hall-a", "key-b"))
-        self.assertIsNone(self.ask.halls.check_key("hall-a", ""))
-        self.assertIsNone(self.ask.halls.check_key("nobody", "key-a"))
-
-    def test_invalid_entries_are_skipped(self) -> None:
-        self.write_halls({
-            "hall-a": {"key_sha256": digest("key-a"), "port": 20001},
-            "Bad_Name": {"key_sha256": digest("x"), "port": 20003},
-            "short-hash": {"key_sha256": "abc", "port": 20004},
-            "out-of-range": {"key_sha256": digest("x"), "port": 30000},
-            "same-port": {"key_sha256": digest("x"), "port": 20001},
-            "no-port": {"key_sha256": digest("x")},
-        })
-        with self.assertLogs("ask", "ERROR"):
-            self.assertIsNotNone(self.ask.halls.get("hall-a"))
-        for name in ("bad_name", "short-hash", "out-of-range", "same-port", "no-port"):
-            self.assertIsNone(self.ask.halls.get(name), name)
-
-    def test_edits_are_picked_up_and_a_broken_file_keeps_the_old_registry(self) -> None:
-        self.write_halls({"hall-c": {"key_sha256": digest("key-c"), "port": 20005}})
-        self.assertIsNotNone(self.ask.halls.get("hall-c"))
-        self.assertIsNone(self.ask.halls.get("hall-a"))
-        self.halls_path.write_text("{not json", encoding="utf-8")
-        os.utime(self.halls_path, (2_000_000, 2_000_000))
-        with self.assertLogs("ask", "ERROR"):
-            self.assertIsNotNone(self.ask.halls.get("hall-c"))
+    def new_code(self, secret: str, starts_at: str = "", now: float = 100.0) -> str:
+        return self.ask.codes.create(digest(secret), starts_at, now)
 
 
 class CodeRegistryTests(AskTestCase):
-    def test_a_hall_registers_and_retires_its_codes(self) -> None:
-        codes = self.ask.codes
-        self.assertEqual(codes.register("hall-a", {"k7m4p2": "2026-11-20T19:30:00-03:00", "b2c3d4": ""}, [], 100.0), [])
-        self.assertEqual(codes.lookup("k7m4p2"), {"hall": "hall-a", "starts_at": "2026-11-20T19:30:00-03:00",
-                                                  "retired_at": 0.0})
-        # A code left out is retired; one listed as retired is recorded even if never active.
-        self.assertEqual(codes.register("hall-a", {"k7m4p2": ""}, ["zzzzzz"], 200.0), [])
-        self.assertEqual(codes.lookup("b2c3d4")["retired_at"], 200.0)
-        self.assertEqual(codes.lookup("zzzzzz")["hall"], "hall-a")
+    def test_created_codes_are_unique_and_owned_by_the_secret(self) -> None:
+        codes = {self.new_code(f"s{i}") for i in range(200)}
+        self.assertEqual(len(codes), 200)
+        self.assertTrue(all(self.ask.MEETING_CODE.match(c) for c in codes))
+        code = self.new_code("mine", "2026-11-20T19:30:00-03:00")
+        self.assertTrue(self.ask.codes.owns(code, "mine"))
+        self.assertFalse(self.ask.codes.owns(code, "theirs"))
+        self.assertFalse(self.ask.codes.owns(code, ""))
+        self.assertEqual(self.ask.codes.lookup(code)["starts_at"], "2026-11-20T19:30:00-03:00")
+
+    def test_sync_updates_only_owned_codes(self) -> None:
+        mine, theirs = self.new_code("mine"), self.new_code("theirs")
+        rejected = self.ask.codes.sync([(mine, "mine", "2026-11-22T09:00:00-03:00", False),
+                                        (theirs, "mine", "", False), ("zzzzzz", "mine", "", True)], 200.0)
+        self.assertEqual(rejected, [theirs, "zzzzzz"])
+        self.assertEqual(self.ask.codes.lookup(mine)["starts_at"], "2026-11-22T09:00:00-03:00")
+        self.assertFalse(self.ask.codes.lookup(mine)["active"])
+        self.assertTrue(self.ask.codes.lookup(theirs)["active"])
+        # The owner can bring a code back.
+        self.ask.codes.sync([(mine, "mine", "", True)], 300.0)
+        self.assertTrue(self.ask.codes.lookup(mine)["active"])
         # Saved, and read back by a fresh registry.
-        again = self.ask.Codes(str(self.codes_path))
-        self.assertEqual(again.lookup("b2c3d4")["retired_at"], 200.0)
+        self.assertTrue(self.ask.Codes(str(self.codes_path)).owns(mine, "mine"))
 
-    def test_another_halls_codes_are_refused_and_nothing_changes(self) -> None:
-        codes = self.ask.codes
-        codes.register("hall-a", {"k7m4p2": ""}, ["b2c3d4"], 100.0)
-        self.assertEqual(codes.register("hall-b", {"k7m4p2": "", "b2c3d4": "", "x9x9x9": ""}, [], 150.0),
-                         ["b2c3d4", "k7m4p2"])
-        self.assertIsNone(codes.lookup("x9x9x9"))
-        # Another hall's code listed as retired is ignored.
-        self.assertEqual(codes.register("hall-b", {}, ["k7m4p2"], 150.0), [])
-        self.assertEqual(codes.lookup("k7m4p2"), {"hall": "hall-a", "starts_at": "", "retired_at": 0.0})
+    def test_codes_nobody_syncs_are_forgotten_after_a_long_time(self) -> None:
+        old = self.new_code("old", now=100.0)
+        kept = self.new_code("kept", now=100.0)
+        later = 100.0 + self.ask.FORGET_AFTER_S - 10
+        self.ask.codes.sync([(kept, "kept", "", True)], later)
+        self.ask.codes.sync([], 100.0 + self.ask.FORGET_AFTER_S + 1)
+        self.assertIsNone(self.ask.codes.lookup(old))
+        self.assertIsNotNone(self.ask.codes.lookup(kept))
 
-    def test_retired_codes_are_forgotten_after_a_long_time(self) -> None:
-        codes = self.ask.codes
-        codes.register("hall-a", {}, ["b2c3d4"], 100.0)
-        codes.register("hall-a", {}, [], 100.0 + self.ask.RETIRED_FOR_S + 1)
-        self.assertIsNone(codes.lookup("b2c3d4"))
-        self.assertEqual(codes.register("hall-b", {"b2c3d4": ""}, [], 100.0 + self.ask.RETIRED_FOR_S + 2), [])
-
-    def test_parse_codes(self) -> None:
-        parse = self.ask.parse_codes
-        self.assertEqual(parse({"codes": [{"code": "k7m4p2", "startsAt": "x"}], "retired": ["b2c3d4"]}),
-                         ({"k7m4p2": "x"}, ["b2c3d4"]))
-        self.assertEqual(parse({"codes": []}), ({}, []))
-        for bad in ({}, {"codes": "k7m4p2"}, {"codes": [{"code": "abc123"}]}, {"codes": [], "retired": ["NOPE"]},
-                    {"codes": [{"code": "k7m4p2", "startsAt": "x" * 41}]}):
+    def test_parse_sync(self) -> None:
+        parse = self.ask.parse_sync
+        self.assertEqual(parse({"codes": [{"code": "k7m4p2", "secret": "s", "startsAt": "x", "active": False}]}),
+                         [("k7m4p2", "s", "x", False)])
+        self.assertEqual(parse({"codes": []}), [])
+        for bad in ({}, {"codes": "k7m4p2"}, {"codes": [{"code": "abc123", "secret": "s"}]},
+                    {"codes": [{"code": "k7m4p2"}]},
+                    {"codes": [{"code": "k7m4p2", "secret": "s", "startsAt": "x" * 41}]}):
             self.assertIsNone(parse(bad), bad)
 
 
 class PluginTests(AskTestCase):
-    def login(self, hall: str, key: str) -> dict:
-        return self.ask.plugin_decision("Login", {"content": {"metas": {"hall": hall, "hall_key": key}}})
-
-    def new_proxy(self, hall: str, key: str, name: str, kind: str = "tcp", port: int = 0) -> dict:
-        content = {"user": {"metas": {"hall": hall, "hall_key": key}}, "proxy_name": name,
-                   "proxy_type": kind, "remote_port": port}
+    def new_proxy(self, code: str, secret: str, name: str | None = None, kind: str = "tcp") -> dict:
+        content = {"user": {"metas": {"code": code, "secret": secret}}, "proxy_name": code if name is None else name,
+                   "proxy_type": kind, "remote_port": 0}
         return self.ask.plugin_decision("NewProxy", {"content": content})
 
-    def test_login(self) -> None:
-        self.assertFalse(self.login("hall-a", "key-a")["reject"])
-        self.assertTrue(self.login("hall-a", "key-b")["reject"])
-        self.assertTrue(self.login("nobody", "key-a")["reject"])
-
-    def test_new_proxy_is_pinned_to_the_registered_port(self) -> None:
-        decision = self.new_proxy("hall-a", "key-a", "hall-a", port=20099)
+    def test_the_owner_gets_a_free_port(self) -> None:
+        code = self.new_code("mine")
+        self.open_tunnels = {"x9x9x9": 20003}
+        decision = self.new_proxy(code, "mine")
         self.assertFalse(decision["reject"])
-        self.assertFalse(decision["unchange"])
-        self.assertEqual(decision["content"]["remote_port"], 20001)
+        port = decision["content"]["remote_port"]
+        self.assertTrue(20000 <= port <= 20009 and port != 20003)
+        # A port just handed out is not handed out again before frps reports it.
+        other = self.new_proxy(self.new_code("b"), "b")["content"]["remote_port"]
+        self.assertNotEqual(other, port)
 
-    def test_a_hall_cannot_take_another_halls_name_or_open_other_proxies(self) -> None:
-        self.assertTrue(self.new_proxy("hall-b", "key-b", "hall-a")["reject"])
-        self.assertTrue(self.new_proxy("hall-a", "wrong", "hall-a")["reject"])
-        self.assertTrue(self.new_proxy("hall-a", "key-a", "hall-a", kind="http")["reject"])
+    def test_others_cannot_open_a_code(self) -> None:
+        code = self.new_code("mine")
+        self.assertTrue(self.new_proxy(code, "wrong")["reject"])
+        self.assertTrue(self.new_proxy("zzzzzz", "mine")["reject"])
+        self.assertTrue(self.new_proxy(code, "mine", name="zzzzzz")["reject"])
+        self.assertTrue(self.new_proxy(code, "mine", kind="http")["reject"])
+
+    def test_no_free_port(self) -> None:
+        self.open_tunnels = {f"c{i}": 20000 + i for i in range(10)}
+        self.assertTrue(self.new_proxy(self.new_code("mine"), "mine")["reject"])
 
     def test_other_operations_pass_through(self) -> None:
-        self.assertEqual(self.ask.plugin_decision("Ping", {}), {"reject": False, "unchange": True})
+        self.assertEqual(self.ask.plugin_decision("Login", {}), {"reject": False, "unchange": True})
 
 
 class HttpTests(AskTestCase):
@@ -176,58 +146,83 @@ class HttpTests(AskTestCase):
             with error:
                 return error.code, dict(error.headers), error.read()
 
-    def put_codes(self, hall: str, key: str, body) -> tuple[int, dict]:
+    def post(self, path: str, body, headers: dict | None = None) -> tuple[int, dict]:
         data = body if isinstance(body, bytes) else json.dumps(body).encode()
-        request = urllib.request.Request(f"{self.base}/api/halls/{hall}/codes", data=data, method="PUT",
-                                         headers={"Authorization": f"Bearer {key}",
-                                                  "Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(request, timeout=5) as response:
-                return response.status, json.loads(response.read())
-        except urllib.error.HTTPError as error:
-            with error:
-                return error.code, json.loads(error.read())
+        status, _, raw = self.get(path, {"Content-Type": "application/json", **(headers or {})}, data)
+        return status, json.loads(raw)
 
     def route(self, uri: str):
         return self.get("/internal/route", {"X-Forwarded-Uri": uri})
 
-    def test_put_codes(self) -> None:
-        body = {"codes": [{"code": "k7m4p2", "startsAt": "2026-11-20T19:30:00-03:00"}], "retired": []}
-        self.assertEqual(self.put_codes("hall-a", "key-a", body), (200, {"ok": True}))
-        self.assertEqual(self.put_codes("hall-a", "key-b", body)[0], 401)
-        self.assertEqual(self.put_codes("nobody", "key-a", body)[0], 401)
-        self.assertEqual(self.put_codes("hall-b", "key-b", body), (409, {"taken": ["k7m4p2"]}))
-        self.assertEqual(self.put_codes("hall-a", "key-a", b"{not json")[0], 400)
-        self.assertEqual(self.put_codes("hall-a", "key-a", {"codes": [{"code": "aeiou1"}]})[0], 400)
+    def test_create_and_sync_codes(self) -> None:
+        status, body = self.post("/api/codes", {"owner": digest("mine"), "startsAt": "2026-11-20T19:30:00-03:00"})
+        self.assertEqual(status, 201)
+        code = body["code"]
+        self.assertTrue(self.ask.codes.owns(code, "mine"))
+        self.assertEqual(self.post("/api/codes", {"owner": "not-a-hash"})[0], 400)
+        self.assertEqual(self.post("/api/codes", b"{not json")[0], 400)
+        status, body = self.post("/api/codes/sync", {"codes": [
+            {"code": code, "secret": "mine", "startsAt": "", "active": False},
+            {"code": code, "secret": "wrong", "startsAt": "", "active": True}]})
+        self.assertEqual((status, body), (200, {"rejected": [code]}))
+        self.assertFalse(self.ask.codes.lookup(code)["active"])
+        self.assertEqual(self.post("/api/codes/sync", {"codes": [{"code": "aeiou1", "secret": "s"}]})[0], 400)
+
+    def test_new_codes_are_rate_limited_per_address(self) -> None:
+        self.ask.create_limit = self.ask.RateLimit(3, 3600)
+        body = {"owner": digest("x")}
+        for _ in range(3):
+            self.assertEqual(self.post("/api/codes", body, {"X-Forwarded-For": "203.0.113.5"})[0], 201)
+        self.assertEqual(self.post("/api/codes", body, {"X-Forwarded-For": "203.0.113.5"})[0], 429)
+        self.assertEqual(self.post("/api/codes", body, {"X-Forwarded-For": "198.51.100.7"})[0], 201)
+
+    def test_turn_credentials_for_the_owner_only(self) -> None:
+        code = self.new_code("mine")
+        status, body = self.post("/api/turn", {"code": code, "secret": "mine"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["urls"], ["turn:hub.example.test:3478?transport=udp",
+                                        "turn:hub.example.test:3478?transport=tcp"])
+        expiry, name = body["username"].split(":")
+        self.assertEqual(name, code)
+        self.assertGreater(int(expiry), 1_700_000_000)
+        expected = base64.b64encode(hmac.new(b"turn-secret", body["username"].encode(), hashlib.sha1).digest())
+        self.assertEqual(body["credential"], expected.decode())
+        self.assertEqual(self.post("/api/turn", {"code": code, "secret": "wrong"})[0], 403)
+        self.ask.codes.sync([(code, "mine", "", False)], 200.0)
+        self.assertEqual(self.post("/api/turn", {"code": code, "secret": "mine"})[0], 403)
+
+    def test_hub_info(self) -> None:
+        self.assertEqual(json.loads(self.get("/api/hub")[2]), {"frpPort": 7000, "frpToken": "frp-token"})
 
     def test_route(self) -> None:
-        self.ask.codes.register("hall-a", {"k7m4p2": ""}, ["b2c3d4"], 100.0)
-        self.ask.codes.register("hall-b", {"x9x9x9": "2026-11-20T19:30:00-03:00"}, [], 100.0)
-        for uri in ("/k7m4p2", "/k7m4p2/", "/k7m4p2/m", "/k7m4p2/ws?x=1"):
+        live = self.new_code("a")
+        waiting = self.new_code("b", "2026-11-20T19:30:00-03:00")
+        retired = self.new_code("c")
+        self.ask.codes.sync([(retired, "c", "", False)], 100.0)
+        self.open_tunnels = {live: 20004}
+        for uri in (f"/{live}", f"/{live}/", f"/{live}/m", f"/{live}/ws?x=1"):
             status, headers, _ = self.route(uri)
-            self.assertEqual((status, headers.get("X-Solin-Hall-Port")), (200, "20001"), uri)
-        # hall-b is offline: the waiting page, with the start time for its countdown.
-        status, headers, body = self.route("/x9x9x9/s")
+            self.assertEqual((status, headers.get("X-Solin-Tunnel-Port")), (200, "20004"), uri)
+        status, headers, body = self.route(f"/{waiting}/s")
         self.assertEqual((status, headers.get("Retry-After")), (503, "10"))
-        self.assertIn(b'data-message="waiting" data-code="x9x9x9" data-starts="2026-11-20T19:30:00-03:00"', body)
-        self.assertNotIn("X-Solin-Hall-Port", headers)
-        status, _, body = self.route("/b2c3d4")
+        expected = f'data-message="waiting" data-code="{waiting}" data-starts="2026-11-20T19:30:00-03:00"'
+        self.assertIn(expected.encode(), body)
+        self.assertNotIn("X-Solin-Tunnel-Port", headers)
+        status, _, body = self.route(f"/{retired}")
         self.assertEqual(status, 410)
         self.assertIn(b'data-message="retired"', body)
+        # A retired code's tunnel is not reachable either.
+        self.open_tunnels[retired] = 20005
+        self.assertEqual(self.route(f"/{retired}")[0], 410)
         for uri in ("/zzzzzz", "/zzzzzzz", "/", ""):
-            status, headers, body = self.route(uri)
+            status, headers, _ = self.route(uri)
             self.assertEqual(status, 404, uri)
-            self.assertNotIn("X-Solin-Hall-Port", headers)
-        # A hall removed from halls.json no longer serves its codes.
-        self.write_halls({"hall-b": {"key_sha256": digest("key-b"), "port": 20002}})
-        self.assertEqual(self.route("/k7m4p2")[0], 404)
+            self.assertNotIn("X-Solin-Tunnel-Port", headers)
 
-    def test_public_endpoints(self) -> None:
+    def test_status_and_health(self) -> None:
+        self.open_tunnels = {"k7m4p2": 20001}
         self.assertEqual(self.get("/healthz")[2], b"ok\n")
-        self.assertIn(b"Halls connected: 1.", self.get("/status")[2])
-        self.assertEqual(json.loads(self.get("/api/halls/hall-a")[2]), {"online": True})
-        self.assertEqual(json.loads(self.get("/api/halls/hall-b")[2]), {"online": False})
-        self.assertEqual(self.get("/api/halls/Bad_Name")[0], 400)
+        self.assertIn(b"Meetings open: 1.", self.get("/status")[2])
 
     def test_landing_page(self) -> None:
         status, headers, body = self.get("/")
@@ -264,7 +259,7 @@ class HttpTests(AskTestCase):
 
     def test_plugin_fails_closed_on_garbage(self) -> None:
         with self.assertLogs("ask", "ERROR"):
-            status, _, body = self.get("/internal/frps-plugin?op=Login", data=b"not json")
+            status, _, body = self.get("/internal/frps-plugin?op=NewProxy", data=b"not json")
         self.assertEqual(status, 200)
         self.assertTrue(json.loads(body)["reject"])
 

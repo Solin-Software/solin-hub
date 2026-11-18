@@ -13,13 +13,13 @@
 	handle @meeting {
 		# Ask answers unknown, retired and not-yet-open codes itself (that response goes straight
 		# to the visitor); for an open meeting it returns the hall's tunnel port. copy_headers first
-		# deletes any client-supplied X-Solin-Hall-Port, so it cannot be spoofed.
+		# deletes any client-supplied X-Solin-Tunnel-Port, so it cannot be spoofed.
 		forward_auth 127.0.0.1:{$ASK_PORT:7400} {
 			uri /internal/route
-			copy_headers X-Solin-Hall-Port
+			copy_headers X-Solin-Tunnel-Port
 		}
-		reverse_proxy 127.0.0.1:{http.request.header.X-Solin-Hall-Port} {
-			header_up -X-Solin-Hall-Port
+		reverse_proxy 127.0.0.1:{http.request.header.X-Solin-Tunnel-Port} {
+			header_up -X-Solin-Tunnel-Port
 			# Stream responses as they come (lobby long-poll / server-sent updates).
 			flush_interval -1
 			# On a Caddy config reload, keep existing WebSockets (meetings) open instead of

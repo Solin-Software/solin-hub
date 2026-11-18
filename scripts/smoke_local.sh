@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
 # End-to-end smoke test of the hub on one machine (local variant: hub.localhost, Caddy internal CA).
 #
-#   deploy/hub/scripts/smoke_local.sh            # full run (~2 min: includes a 95 s idle WebSocket)
-#   WS_IDLE=10 deploy/hub/scripts/smoke_local.sh # quicker
-#   KEEP=1 deploy/hub/scripts/smoke_local.sh     # leave the hub running afterwards
+#   scripts/smoke_local.sh            # full run (~2 min: includes a 95 s idle WebSocket)
+#   WS_IDLE=10 scripts/smoke_local.sh # quicker
+#   KEEP=1 scripts/smoke_local.sh     # leave the hub running afterwards
 #
-# Needs: docker with the compose plugin, python3 (standard library only), free ports
+# Needs: docker with the compose plugin, python3 (standard library only), curl, free ports
 # 8880, 8443, 7000, 7400, 7500, 3478 (+ UDP 49160-49260), 18081-18083, 20000-20099.
 #
-# Brings up Caddy + frps + ask + coturn, starts dummy halls (HTTP + WebSocket echo, like Solin's
-# meeting web server) with the official frpc image, and checks:
-#   - halls register their meeting codes (PUT /api/halls/<hall>/codes, hall key); another hall
-#     cannot take them; unknown codes get the landing page, retired ones "no longer valid"
-#   - HTTPS GET/POST to https://HUB_DOMAIN/<code>/... reaches the hall that registered the code
-#     (Caddy -> frps -> frpc -> hall), with X-Forwarded-* headers
+# Brings up Caddy + frps + ask + coturn, starts dummy meetings (HTTP + WebSocket echo, like Solin's
+# meeting web server) behind the official frpc image, exactly as Solin would, and checks:
+#   - the hub creates meeting codes (POST /api/codes) owned by a secret; the owner can update and
+#     retire them, nobody else can
+#   - HTTPS GET/POST to https://HUB_DOMAIN/<code>/... reaches that meeting's tunnel
+#     (Caddy -> frps -> frpc -> meeting), with X-Forwarded-* headers
 #   - a WebSocket through the hub survives WS_IDLE seconds (default 95) of total silence
-#   - a hall with a wrong key cannot claim another hall's name, nor can a registered hall
-#     publish under another hall's name; the real hall keeps its meetings
-#   - an offline hall's codes get the hub's waiting page; a restarted frpc gets its meetings back
-#   - TURN allocates with time-limited credentials (UDP, TCP, IPv6), refuses expired/forged
-#     ones, and refuses relaying to private/loopback peers
+#   - a tunnel for a code needs that code's secret, and must be named after the code
+#   - a closed meeting's code gets the hub's waiting page; a retired one "no longer valid";
+#     an unknown one the landing page; a restarted frpc gets its meeting back
+#   - TURN credentials come from the hub per code; coturn allocates with them (UDP, TCP, IPv6),
+#     refuses expired/forged ones, and refuses relaying to private/loopback peers
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -35,8 +35,6 @@ PY="python3 -I $HERE/scripts/hubtest.py"
 WORK="$(mktemp -d)"
 COMPOSE=(docker compose --env-file "$ENVFILE")
 HUB_URL="https://${HUB_DOMAIN}:${HTTPS_PORT}"
-CODE_A=k7m4p2
-CODE_B=b2c3d4
 CONNECT="127.0.0.1:${HTTPS_PORT}"
 PIDS=()
 FAILS=0
@@ -59,26 +57,33 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# frpc config for a hall, rendered from hall/frpc.toml.template exactly as Solin would.
-frpc_conf() { # name key local_port [proxy_name_override]
+# frpc config for a meeting, rendered from client/frpc.toml.template exactly as Solin would.
+frpc_conf() { # code secret local_port [proxy_name_override]
     sed -e "s|\${HUB_ADDR}|127.0.0.1|g" -e "s|\${HUB_FRP_PORT}|${FRP_BIND_PORT}|g" \
-        -e "s|\${FRP_TOKEN}|${FRP_TOKEN}|g" -e "s|\${HALL_NAME}|$1|g" -e "s|\${HALL_KEY}|$2|g" \
-        -e "s|\${LOCAL_PORT}|$3|g" hall/frpc.toml.template > "$WORK/frpc-$1-$3.toml"
+        -e "s|\${FRP_TOKEN}|${FRP_TOKEN}|g" -e "s|\${CODE}|$1|g" -e "s|\${SECRET}|$2|g" \
+        -e "s|\${LOCAL_PORT}|$3|g" client/frpc.toml.template > "$WORK/frpc-$1-$3.toml"
     if [ -n "${4:-}" ]; then sed -i "s|^name = \"$1\"|name = \"$4\"|" "$WORK/frpc-$1-$3.toml"; fi
     echo "$WORK/frpc-$1-$3.toml"
 }
 start_frpc() { # container conf
     docker run -d --name "$1" --network host -v "$2:/etc/frp/frpc.toml:ro" "$FRPC_IMAGE" -c /etc/frp/frpc.toml >/dev/null
 }
-start_hall() { # name port
-    $PY hall --name "$1" --port "$2" > "$WORK/hall-$1.log" 2>&1 &
+start_meeting() { # name port
+    $PY hall --name "$1" --port "$2" > "$WORK/meeting-$1.log" 2>&1 &
     PIDS+=($!)
 }
-ask_status() { curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${ASK_PORT}$1"; }
-online() { curl -s "http://127.0.0.1:${ASK_PORT}/api/halls/$1" | grep -q '"online": true'; }
-put_codes() { # hall key json -> HTTP status
-    curl -s -o "$WORK/put.out" -w '%{http_code}' --cacert "$WORK/ca.crt" --resolve "${HUB_DOMAIN}:${HTTPS_PORT}:127.0.0.1" \
-        -X PUT -H "Authorization: Bearer $2" -H 'Content-Type: application/json' --data "$3" "$HUB_URL/api/halls/$1/codes"
+api() { # method path [json] -> body in $WORK/api.out, prints the HTTP status
+    curl -s -o "$WORK/api.out" -w '%{http_code}' --cacert "$WORK/ca.crt" \
+        --resolve "${HUB_DOMAIN}:${HTTPS_PORT}:127.0.0.1" -X "$1" -H 'Content-Type: application/json' \
+        ${3:+--data "$3"} "$HUB_URL$2"
+}
+sha256() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+new_code() { # secret starts_at -> prints the code
+    api POST /api/codes "{\"owner\":\"$(sha256 "$1")\",\"startsAt\":\"$2\"}" >/dev/null
+    python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["code"])' "$WORK/api.out"
+}
+open_now() { # code: frps reports its tunnel, so the hub routes it
+    [ "$(curl -s -o /dev/null -w '%{http_code}' -H "X-Forwarded-Uri: /$1" "http://127.0.0.1:${ASK_PORT}/internal/route")" = 200 ]
 }
 wait_for() { # seconds description command...
     local t=$1 what=$2; shift 2
@@ -95,72 +100,82 @@ wait_for 30 "caddy" bash -c "curl -sk -o /dev/null -w '%{http_code}' --resolve $
 CA=(--cacert "$WORK/ca.crt" --connect "$CONNECT")
 "${COMPOSE[@]}" ps --format '  {{.Service}}: {{.Status}}'
 
-step "Halls connect (frpc, official image) to dummy meeting web servers"
-start_hall hall-a 18081
-start_hall hall-b 18082
-start_hall evil 18083
-start_frpc smoke-frpc-a "$(frpc_conf hall-a hall-a-test-key 18081)"
-start_frpc smoke-frpc-b "$(frpc_conf hall-b hall-b-test-key 18082)"
-if wait_for 20 "hall-a online" online hall-a && wait_for 20 "hall-b online" online hall-b; then
-    pass "hall-a and hall-b connected; ask reports them online"
-else
-    fail "halls did not come online"; docker logs smoke-frpc-a 2>&1 | tail -5
-fi
-
-step "Meeting codes (registered by each hall's Solin)"
-[ "$(put_codes hall-a hall-a-test-key "{\"codes\":[{\"code\":\"$CODE_A\",\"startsAt\":\"\"},{\"code\":\"x9x9x9\",\"startsAt\":\"\"}]}")" = 200 ] \
-    && pass "hall-a registered $CODE_A and x9x9x9" || fail "hall-a codes: $(cat "$WORK/put.out")"
-[ "$(put_codes hall-b hall-b-test-key "{\"codes\":[{\"code\":\"$CODE_B\",\"startsAt\":\"2030-01-01T19:30:00Z\"}]}")" = 200 ] \
-    && pass "hall-b registered $CODE_B" || fail "hall-b codes: $(cat "$WORK/put.out")"
-[ "$(put_codes hall-b hall-b-test-key "{\"codes\":[{\"code\":\"$CODE_A\"}]}")" = 409 ] && grep -q "$CODE_A" "$WORK/put.out" \
-    && pass "hall-b cannot take hall-a's code (409 taken)" || fail "code theft: $(cat "$WORK/put.out")"
-[ "$(put_codes hall-a wrong-key '{"codes":[]}')" = 401 ] && pass "wrong hall key refused (401)" || fail "wrong key accepted"
-out="$($PY http "$(url zzzzzz)" "${CA[@]}" --expect 404 --contains 'data-message="notfound"' 2>&1)"  \
+step "Meeting codes (created by the hub, owned by a secret)"
+CODE_A="$(new_code secret-a "")" && CODE_B="$(new_code secret-b 2030-01-01T19:30:00Z)" \
+    && CODE_C="$(new_code secret-c "")" && pass "codes created: $CODE_A $CODE_B $CODE_C" || fail "creating codes"
+[ "$(api POST /api/hub)" = 404 ] && [ "$(api GET /api/hub)" = 200 ] && grep -q "$FRP_TOKEN" "$WORK/api.out" \
+    && pass "GET /api/hub hands out the tunnel token" || fail "/api/hub: $(cat "$WORK/api.out")"
+[ "$(api POST /api/codes/sync "{\"codes\":[{\"code\":\"$CODE_A\",\"secret\":\"secret-b\",\"active\":false}]}")" = 200 ] \
+    && grep -q "$CODE_A" "$WORK/api.out" && pass "another secret cannot retire $CODE_A" || fail "foreign sync: $(cat "$WORK/api.out")"
+out="$($PY http "$(url zzzzzz)" "${CA[@]}" --expect 404 --contains 'data-message="notfound"' 2>&1)" \
     && pass "unknown code: landing page with 'no such meeting'" || fail "unknown code: $out"
-out="$($PY http "$HUB_URL/" "${CA[@]}" --expect 200 --contains 'action="/go"' 2>&1)"  \
+out="$($PY http "$HUB_URL/" "${CA[@]}" --expect 200 --contains 'action="/go"' 2>&1)" \
     && pass "landing page at /" || fail "landing: $out"
 
-step "HTTPS through Caddy -> frps -> frpc -> hall"
-out="$($PY http "$(url $CODE_A /join/m1)" "${CA[@]}" --expect 200 2>&1)" \
-    && echo "$out" | grep -q '"hall": "hall-a"' && echo "$out" | grep -q '"x-forwarded-proto": "https"' \
-    && pass "GET /$CODE_A/join/m1 reaches hall-a: $out" || fail "GET $CODE_A: $out"
-out="$($PY http "$(url $CODE_A /api/lobby)" "${CA[@]}" --post '{"name":"Ana"}' --expect 200 2>&1)" \
-    && echo "$out" | grep -q 'Ana' && pass "POST hall-a body echoed: $out" || fail "POST hall-a: $out"
-out="$($PY http "$(url $CODE_B)" "${CA[@]}" --expect 200 2>&1)" \
-    && echo "$out" | grep -q '"hall": "hall-b"' && pass "GET /$CODE_B reaches hall-b" || fail "GET $CODE_B: $out"
-out="$($PY http "https://${HUB_DOMAIN}:${HTTPS_PORT}/api/halls/hall-a" "${CA[@]}" --expect 200 2>&1)" \
-    && echo "$out" | grep -q '"online": true' && pass "directory: GET /api/halls/hall-a -> $out" || fail "directory: $out"
-out="$($PY http "https://${HUB_DOMAIN}:${HTTPS_PORT}/internal/route" "${CA[@]}" --expect 404 2>&1)" \
+step "Meetings open their tunnels (frpc, official image) to dummy meeting web servers"
+start_meeting a 18081
+start_meeting b 18082
+start_meeting evil 18083
+start_frpc smoke-frpc-a "$(frpc_conf "$CODE_A" secret-a 18081)"
+start_frpc smoke-frpc-b "$(frpc_conf "$CODE_B" secret-b 18082)"
+if wait_for 20 "$CODE_A open" open_now "$CODE_A" && wait_for 20 "$CODE_B open" open_now "$CODE_B"; then
+    pass "both meetings open; the hub routes their codes"
+else
+    fail "meetings did not open"; docker logs smoke-frpc-a 2>&1 | tail -5
+fi
+
+step "HTTPS through Caddy -> frps -> frpc -> meeting"
+out="$($PY http "$(url "$CODE_A" /join/m1)" "${CA[@]}" --expect 200 2>&1)" \
+    && echo "$out" | grep -q '"hall": "a"' && echo "$out" | grep -q '"x-forwarded-proto": "https"' \
+    && pass "GET /$CODE_A/join/m1 reaches meeting a: $out" || fail "GET $CODE_A: $out"
+out="$($PY http "$(url "$CODE_A" /api/lobby)" "${CA[@]}" --post '{"name":"Ana"}' --expect 200 2>&1)" \
+    && echo "$out" | grep -q 'Ana' && pass "POST body echoed: $out" || fail "POST: $out"
+out="$($PY http "$(url "$CODE_B")" "${CA[@]}" --expect 200 2>&1)" \
+    && echo "$out" | grep -q '"hall": "b"' && pass "GET /$CODE_B reaches meeting b" || fail "GET $CODE_B: $out"
+out="$($PY http "$HUB_URL/internal/route" "${CA[@]}" --expect 404 2>&1)" \
     && pass "internal endpoints not reachable from outside" || fail "internal endpoint exposed: $out"
 
 step "Long-lived WebSocket (${WS_IDLE} s idle) through the hub, in the background"
-$PY ws "$(url $CODE_A /ws)" "${CA[@]}" --idle "$WS_IDLE" > "$WORK/ws.log" 2>&1 &
+$PY ws "$(url "$CODE_A" /ws)" "${CA[@]}" --idle "$WS_IDLE" > "$WORK/ws.log" 2>&1 &
 WS_PID=$!
 sleep 2
 head -1 "$WORK/ws.log"
 
-step "Hijack attempts on hall-a's name"
-start_frpc smoke-frpc-evil "$(frpc_conf hall-a wrong-key 18083)"
-start_frpc smoke-frpc-steal "$(frpc_conf hall-b hall-b-test-key 18083 hall-a)"
+step "Hijack attempts on $CODE_A"
+start_frpc smoke-frpc-evil "$(frpc_conf "$CODE_A" wrong-secret 18083)"
+start_frpc smoke-frpc-steal "$(frpc_conf "$CODE_C" secret-c 18083 "$CODE_A")"
 sleep 4
-docker logs smoke-frpc-evil 2>&1 | grep -q "wrong hall key" \
-    && pass "frpc claiming hall-a with a wrong key: login refused" || { fail "wrong-key frpc not refused"; docker logs smoke-frpc-evil 2>&1 | tail -3; }
-docker logs smoke-frpc-steal 2>&1 | grep -q "must be named 'hall-b'" \
-    && pass "hall-b (valid key) publishing a proxy named hall-a: refused" || { fail "proxy theft not refused"; docker logs smoke-frpc-steal 2>&1 | tail -3; }
-out="$($PY http "$(url $CODE_A /after-hijack)" "${CA[@]}" --expect 200 2>&1)" \
-    && echo "$out" | grep -q '"hall": "hall-a"' && pass "hall-a still served by the real hall" || fail "hall-a after hijack: $out"
+docker logs smoke-frpc-evil 2>&1 | grep -q "wrong secret" \
+    && pass "a tunnel for $CODE_A with a wrong secret: refused" || { fail "wrong-secret frpc not refused"; docker logs smoke-frpc-evil 2>&1 | tail -3; }
+docker logs smoke-frpc-steal 2>&1 | grep -q "must be named '$CODE_C'" \
+    && pass "the owner of $CODE_C publishing a tunnel named $CODE_A: refused" || { fail "tunnel theft not refused"; docker logs smoke-frpc-steal 2>&1 | tail -3; }
+out="$($PY http "$(url "$CODE_A" /after-hijack)" "${CA[@]}" --expect 200 2>&1)" \
+    && echo "$out" | grep -q '"hall": "a"' && pass "$CODE_A still served by its meeting" || fail "$CODE_A after hijack: $out"
 docker rm -f smoke-frpc-evil smoke-frpc-steal >/dev/null
 
-step "Offline hall"
+step "Closed meeting"
 docker rm -f smoke-frpc-b >/dev/null
-wait_for 10 "hall-b offline" bash -c "! curl -s http://127.0.0.1:${ASK_PORT}/api/halls/hall-b | grep -q true" || true
-out="$($PY http "$(url $CODE_B /s)" "${CA[@]}" --expect 503 --contains 'data-message="waiting"' 2>&1)"  \
-    && pass "hall-b offline: its code gets the hub's waiting page (503)" || fail "offline hall-b: $out"
+wait_for 10 "$CODE_B closed" bash -c "! curl -s -o /dev/null -w '%{http_code}' -H 'X-Forwarded-Uri: /$CODE_B' http://127.0.0.1:${ASK_PORT}/internal/route | grep -q 200" || true
+out="$($PY http "$(url "$CODE_B" /s)" "${CA[@]}" --expect 503 --contains 'data-message="waiting"' 2>&1)" \
+    && pass "$CODE_B closed: the hub's waiting page (503)" || fail "closed $CODE_B: $out"
 
 step "Retired code"
-[ "$(put_codes hall-a hall-a-test-key "{\"codes\":[{\"code\":\"$CODE_A\",\"startsAt\":\"\"}]}")" = 200 ] || fail "hall-a re-register"
-out="$($PY http "$(url x9x9x9)" "${CA[@]}" --expect 410 --contains 'data-message="retired"' 2>&1)"  \
-    && pass "x9x9x9, dropped by hall-a: 'no longer valid' (410)" || fail "retired code: $out"
+[ "$(api POST /api/codes/sync "{\"codes\":[{\"code\":\"$CODE_C\",\"secret\":\"secret-c\",\"active\":false}]}")" = 200 ] \
+    && grep -q '"rejected": \[\]' "$WORK/api.out" || fail "retiring $CODE_C: $(cat "$WORK/api.out")"
+out="$($PY http "$(url "$CODE_C")" "${CA[@]}" --expect 410 --contains 'data-message="retired"' 2>&1)" \
+    && pass "$CODE_C retired by its owner: 'no longer valid' (410)" || fail "retired code: $out"
+
+step "TURN credentials from the hub"
+[ "$(api POST /api/turn "{\"code\":\"$CODE_A\",\"secret\":\"wrong\"}")" = 403 ] \
+    && pass "no TURN credentials without the code's secret" || fail "TURN credentials leaked"
+[ "$(api POST /api/turn "{\"code\":\"$CODE_A\",\"secret\":\"secret-a\"}")" = 200 ] || fail "TURN credentials: $(cat "$WORK/api.out")"
+TURN_USER="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["username"])' "$WORK/api.out")"
+TURN_PASS="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["credential"])' "$WORK/api.out")"
+if $PY turn 127.0.0.1 --port "$TURN_PORT" --username "$TURN_USER" --password "$TURN_PASS" --peer 8.8.8.8; then
+    pass "coturn accepts the hub's credentials for $CODE_A"
+else
+    fail "coturn refused the hub's credentials"
+fi
 
 step "TURN (coturn) with time-limited credentials"
 if $PY turn 127.0.0.1 --port "$TURN_PORT" --secret "$TURN_SECRET" --peer 8.8.8.8 \
@@ -179,13 +194,13 @@ fi
 step "Waiting for the WebSocket soak to finish"
 if wait "$WS_PID"; then pass "$(tail -1 "$WORK/ws.log" | sed 's/^PASS: //')"; else fail "WebSocket: $(cat "$WORK/ws.log")"; fi
 
-step "Hall reconnects after its tunnel drops"
+step "A meeting reconnects after its tunnel drops"
 docker restart smoke-frpc-a >/dev/null
-if wait_for 20 "hall-a back online" online hall-a \
-        && out="$($PY http "$(url $CODE_A /back)" "${CA[@]}" --expect 200 2>&1)"; then
-    pass "hall-a serves $CODE_A again after an frpc restart"
+if wait_for 20 "$CODE_A open again" open_now "$CODE_A" \
+        && out="$($PY http "$(url "$CODE_A" /back)" "${CA[@]}" --expect 200 2>&1)"; then
+    pass "$CODE_A served again after an frpc restart"
 else
-    fail "hall-a did not come back: ${out:-}"
+    fail "$CODE_A did not come back: ${out:-}"
 fi
 
 step "Result"

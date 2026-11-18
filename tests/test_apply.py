@@ -19,7 +19,7 @@ spec.loader.exec_module(apply)
 GOOD_ENV = {
     "HUB_DOMAIN": "hub.solin.test", "ACME_EMAIL": "ops@solin.test", "PUBLIC_IP": "198.51.100.7",
     "FRP_BIND_PORT": "7000", "FRP_TOKEN": "a" * 64, "FRP_ADMIN_PORT": "7500", "FRP_ADMIN_PASSWORD": "b" * 64,
-    "HALL_PORT_MIN": "20000", "HALL_PORT_MAX": "20999", "ASK_PORT": "7400", "TURN_SECRET": "c" * 64,
+    "TUNNEL_PORT_MIN": "20000", "TUNNEL_PORT_MAX": "20999", "ASK_PORT": "7400", "TURN_SECRET": "c" * 64,
 }
 ALL = set(apply.SERVICES)
 

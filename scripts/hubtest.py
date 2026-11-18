@@ -341,7 +341,8 @@ def run_turn(args: argparse.Namespace) -> int:
     fails = 0
 
     t = Turn(args.host, args.port, args.tcp)
-    ok, info = t.allocate(*rest_credentials(args.secret, 3600), family=args.relay_family)
+    given = (args.username, args.password) if args.username else None
+    ok, info = t.allocate(*(given or rest_credentials(args.secret, 3600)), family=args.relay_family)
     print(f"{'PASS' if ok else 'FAIL'}: allocate (IPv{args.relay_family} relay) with valid time-limited "
           f"credentials on {where}: {info}")
     fails += not ok
@@ -357,6 +358,8 @@ def run_turn(args: argparse.Namespace) -> int:
                   + (f" (error {err})" if not good else " -- it was GRANTED"))
             fails += good
         t.release()
+    if given:   # credentials handed out by the hub: no secret here to forge expired/wrong ones
+        return 1 if fails else 0
 
     for label, creds in (("expired credentials", rest_credentials(args.secret, -60)),
                          ("credentials signed with a wrong secret", rest_credentials(args.secret + "x", 3600))):
@@ -391,13 +394,17 @@ def main() -> int:
     p = sub.add_parser("turn")
     p.add_argument("host")
     p.add_argument("--port", type=int, default=3478)
-    p.add_argument("--secret", required=True)
+    p.add_argument("--secret", help="TURN_SECRET: mint credentials here (and check bad ones are refused)")
+    p.add_argument("--username", help="use these credentials (from the hub's POST /api/turn) instead")
+    p.add_argument("--password")
     p.add_argument("--tcp", action="store_true")
     p.add_argument("--relay-family", type=int, choices=(4, 6), default=4)
     p.add_argument("--peer", action="append", help="public peer that must be permitted")
     p.add_argument("--denied-peer", action="append", help="private peer that must be refused")
     args = ap.parse_args()
     if args.cmd == "turn":
+        if not args.secret and not (args.username and args.password):
+            ap.error("turn needs --secret, or --username and --password")
         return run_turn(args)
     return asyncio.run({"hall": run_hall, "http": run_http, "ws": run_ws}[args.cmd](args))
 

@@ -1,11 +1,12 @@
-# Solin meeting hub: Caddy (HTTPS per hall, on-demand TLS) -> frps (reverse tunnels from hall PCs)
-# + coturn (TURN relay) + ask (hall registry, TLS gate, frps plugin, status page).
+# Solin meeting hub: Caddy (HTTPS, https://HUB_DOMAIN/<code>) -> frps (reverse tunnels from the
+# Solin running each meeting) + coturn (TURN relay) + ask (meeting codes, routing, frps plugin,
+# landing page).
 #
-#   cp hub.env.example hub.env && cp halls.json.example halls.json   # then edit both
+#   cp hub.env.example hub.env   # then edit it
 #   docker compose up -d
 #
 # Every service uses host networking: coturn needs a large UDP port range, and the internal
-# services (ask, frps admin API, per-hall tunnel ports) bind to 127.0.0.1 only.
+# services (ask, frps admin API, per-meeting tunnel ports) bind to 127.0.0.1 only.
 # The local development variant: see local/hub.env.local and README.md.
 
 x-logging: &logging
@@ -45,10 +46,7 @@ services:
     network_mode: host
     restart: unless-stopped
     env_file: ${HUB_ENV_FILE:-hub.env}
-    # The whole bundle directory, read-only, so edits to halls.json (even ones that replace the
-    # file) are picked up without a restart.
     volumes:
-      - ./:/hub:ro
       # The meeting-code registry (codes.json), kept across deploys.
       - ask-data:/data
     logging: *logging

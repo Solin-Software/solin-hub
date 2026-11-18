@@ -1,6 +1,4 @@
 # Live configuration and state: only on the VPS, never in git.
 /hub.env
-/halls.json
-/.halls.*
 /.deployed/
 __pycache__/

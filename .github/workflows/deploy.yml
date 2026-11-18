@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       force:
-        description: Restart the tunnel server / TURN relay even while halls are connected (cuts running meetings)
+        description: Restart the tunnel server / TURN relay even while meetings are open (cuts running meetings)
         type: boolean
         default: false
       dry_run:
