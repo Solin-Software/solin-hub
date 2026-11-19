@@ -38,6 +38,7 @@ import base64
 import hashlib
 import hmac
 import html
+import ipaddress
 import json
 import logging
 import os
@@ -80,8 +81,15 @@ MAX_SYNC_CODES = 300
 MAX_TITLE = 80
 KINDS = ("", "midweek", "weekend", "extra", "unscheduled")   # the waiting page names each in the visitor's language
 MAX_BODY = 256 * 1024
-# New codes per client address: a congregation needs ~10 a month; this only stops floods.
+# New codes per client address (an IPv6 /64 counts as one): a congregation needs ~10 a month;
+# this only stops floods. The global limit and the registry cap bound what many addresses can do.
 CREATE_LIMIT = (120, 3600.0)
+CREATE_LIMIT_ALL = (3000, 3600.0)
+MAX_CODES = 200_000
+# Codes that do not exist, per client address: a typo or two is normal; past this the address
+# is probing for codes, and every code that is not an open meeting answers "too many attempts"
+# (so the waiting page's name and start time cannot be harvested). Open meetings still route.
+MISS_LIMIT = (20, 900.0)
 LANDING = (Path(__file__).with_name("landing.html")).read_text(encoding="utf-8")
 PORT_HEADER = "X-Solin-Tunnel-Port"
 HTML = "text/html; charset=utf-8"
@@ -133,9 +141,13 @@ class Codes:
         entry = self.lookup(code)
         return bool(entry and secret and hmac.compare_digest(entry["owner"], digest(secret)))
 
-    def create(self, owner: str, starts_at: str, now: float, title: str = "", kind: str = "") -> str:
+    def create(self, owner: str, starts_at: str, now: float, title: str = "", kind: str = "") -> str | None:
+        """A new code, or None when the registry is full."""
+
         with self._lock:
             self._forget(now)
+            if len(self._codes) >= MAX_CODES:
+                return None
             while True:
                 code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(6))
                 if code not in self._codes:
@@ -233,6 +245,13 @@ class RateLimit:
         self._hits: dict[str, deque[float]] = {}
         self._lock = threading.Lock()
 
+    def over(self, key: str, now: float) -> bool:
+        """Whether ``key`` is at its limit, without counting a hit."""
+
+        with self._lock:
+            hits = self._hits.get(key)
+            return bool(hits) and sum(1 for t in hits if now - t < self.window_s) >= self.limit
+
     def allow(self, key: str, now: float) -> bool:
         with self._lock:
             if len(self._hits) > 10_000:
@@ -249,6 +268,22 @@ class RateLimit:
 codes = Codes(CODES_FILE)
 tunnels = Tunnels()
 create_limit = RateLimit(*CREATE_LIMIT)
+create_limit_all = RateLimit(*CREATE_LIMIT_ALL)
+miss_limit = RateLimit(*MISS_LIMIT)
+
+
+def client_key(address: str) -> str:
+    """Rate-limit key: an IPv4 address, or an IPv6 address's /64 (one subscriber gets a whole /64)."""
+
+    try:
+        ip = ipaddress.ip_address(address.strip().strip("[]"))
+    except ValueError:
+        return address
+    if ip.version == 4:
+        return str(ip)
+    if ip.ipv4_mapped is not None:
+        return str(ip.ipv4_mapped)
+    return str(ipaddress.ip_network(f"{ip}/64", strict=False))
 
 
 def plugin_decision(op: str, body: dict) -> dict:
@@ -319,7 +354,7 @@ def normalize_code(text: str) -> str:
 
 
 def landing(message: str = "", code: str = "", starts_at: str = "", title: str = "", kind: str = "") -> bytes:
-    """message: "" | "invalid" | "notfound" | "retired" | "waiting" (shown in the visitor's language)."""
+    """message: "" | "invalid" | "notfound" | "retired" | "toomany" | "waiting" (in the visitor's language)."""
 
     fields = {"MESSAGE": message, "CODE": code, "STARTS": starts_at, "TITLE": title, "KIND": kind}
     page = LANDING
@@ -348,8 +383,9 @@ class Handler(BaseHTTPRequestHandler):
         self._send(status, json.dumps(data).encode(), "application/json")
 
     def _client(self) -> str:
-        # Caddy sets X-Forwarded-For to the visitor's address; ask only listens on loopback.
-        return (self.headers.get("X-Forwarded-For") or self.client_address[0]).split(",")[0].strip()
+        # Caddy sets X-Forwarded-For to the visitor's address (replacing any the visitor sent);
+        # ask only listens on loopback.
+        return client_key((self.headers.get("X-Forwarded-For") or self.client_address[0]).split(",")[0].strip())
 
     def _body(self) -> dict | None:
         length = int(self.headers.get("Content-Length") or 0)
@@ -397,8 +433,12 @@ class Handler(BaseHTTPRequestHandler):
         uri = self.headers.get("X-Forwarded-Uri") or ""
         code = urlparse(uri).path.strip("/").split("/", 1)[0].lower()
         entry = codes.lookup(code) if MEETING_CODE.match(code) else None
-        port = tunnels.port_of(code) if entry else None
-        if entry is None:
+        port = tunnels.port_of(code) if entry and entry["active"] else None
+        client, now = self._client(), time.monotonic()
+        if port is None and (miss_limit.over(client, now) or (entry is None and not miss_limit.allow(client, now))):
+            log.info("too many unknown codes from %s", client)
+            self._send(429, landing("toomany"), HTML, {"Retry-After": str(int(MISS_LIMIT[1]))})
+        elif entry is None:
             self._send(404, landing("notfound", code[:12]), HTML)
         elif not entry["active"]:
             self._send(410, landing("retired", code), HTML)
@@ -433,11 +473,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": "expected {owner: <sha256 hex of a secret>, startsAt}"})
             elif not create_limit.allow(self._client(), time.monotonic()):
                 self._json(429, {"error": "too many new codes from this address; try again later"})
+            elif not create_limit_all.allow("*", time.monotonic()):
+                log.warning("global new-code limit reached")
+                self._json(503, {"error": "the hub is giving out too many codes right now; try again later"})
             else:
                 code = codes.create(owner, starts_at, time.time(), clean_title(body.get("title")),
                                     clean_kind(body.get("kind")))
-                log.info("code created: %s", code)
-                self._json(201, {"code": code})
+                if code is None:
+                    log.error("code registry full (%d codes)", MAX_CODES)
+                    self._json(503, {"error": "the hub cannot take new codes right now"})
+                else:
+                    log.info("code created: %s", code)
+                    self._json(201, {"code": code})
         elif url.path == "/api/codes/sync":
             items = parse_sync(body)
             if items is None:

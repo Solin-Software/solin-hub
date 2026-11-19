@@ -122,6 +122,7 @@ footer a:hover { color: var(--text); }
           codeLabel: 'Meeting code', join: 'Join', hint: 'The code has 6 letters and numbers, as in meet.solin.run/abc234.',
           about: 'About Solin', empty: 'Type the meeting code.', invalid: 'That is not a meeting code. Check it and try again.',
           notfound: 'There is no meeting with code {code}. Check the code and try again.',
+          toomany: 'Too many codes tried from this connection. Wait 15 minutes and try again.',
           retired: 'The link with code {code} is no longer valid. Ask your congregation for the new one.',
           waitingTitle: 'The meeting has not opened yet', waitingLead: 'Meeting {code}',
           kinds: { midweek: 'Midweek meeting', weekend: 'Weekend meeting', extra: 'Meeting', unscheduled: 'Meeting' },
@@ -131,6 +132,7 @@ footer a:hover { color: var(--text); }
           codeLabel: 'Código da reunião', join: 'Entrar', hint: 'O código tem 6 letras e números, como em meet.solin.run/abc234.',
           about: 'Sobre o Solin', empty: 'Digite o código da reunião.', invalid: 'Esse não é um código de reunião. Confira e tente de novo.',
           notfound: 'Não existe reunião com o código {code}. Confira o código e tente de novo.',
+          toomany: 'Muitos códigos tentados a partir desta conexão. Aguarde 15 minutos e tente de novo.',
           retired: 'O link com o código {code} não é mais válido. Peça o novo à sua congregação.',
           waitingTitle: 'A reunião ainda não foi aberta', waitingLead: 'Reunião {code}',
           kinds: { midweek: 'Reunião do meio de semana', weekend: 'Reunião do fim de semana', extra: 'Reunião', unscheduled: 'Reunião' },
@@ -140,6 +142,7 @@ footer a:hover { color: var(--text); }
           codeLabel: 'Código de la reunión', join: 'Entrar', hint: 'El código tiene 6 letras y números, como en meet.solin.run/abc234.',
           about: 'Acerca de Solin', empty: 'Escriba el código de la reunión.', invalid: 'Ese no es un código de reunión. Revíselo e inténtelo de nuevo.',
           notfound: 'No existe ninguna reunión con el código {code}. Revise el código e inténtelo de nuevo.',
+          toomany: 'Demasiados códigos probados desde esta conexión. Espere 15 minutos e inténtelo de nuevo.',
           retired: 'El enlace con el código {code} ya no es válido. Pida el nuevo a su congregación.',
           waitingTitle: 'La reunión aún no se ha abierto', waitingLead: 'Reunión {code}',
           kinds: { midweek: 'Reunión de entre semana', weekend: 'Reunión del fin de semana', extra: 'Reunión', unscheduled: 'Reunión' },
@@ -159,7 +162,7 @@ footer a:hover { color: var(--text); }
   const normalize = s => s.toLowerCase().replace(/^.*\//, '').replace(/[\s-]/g, '');
   const show = (key, code) => {
     message.textContent = key ? T[key].replace('{code}', code || '') : '';
-    const notice = key === 'notfound' || key === 'retired';
+    const notice = key === 'notfound' || key === 'retired' || key === 'toomany';
     message.className = notice ? 'message notice' : 'message';
     input.setAttribute('aria-invalid', key && !notice ? 'true' : 'false');
   };

@@ -189,6 +189,49 @@ class HttpTests(AskTestCase):
         self.assertEqual(self.post("/api/codes", body, {"X-Forwarded-For": "203.0.113.5"})[0], 429)
         self.assertEqual(self.post("/api/codes", body, {"X-Forwarded-For": "198.51.100.7"})[0], 201)
 
+    def test_an_ipv6_subscriber_counts_as_one_address(self) -> None:
+        self.ask.create_limit = self.ask.RateLimit(2, 3600)
+        body = {"owner": digest("x")}
+        for host in ("2001:db8:1:2::a", "2001:db8:1:2:ffff::1"):
+            self.assertEqual(self.post("/api/codes", body, {"X-Forwarded-For": host})[0], 201)
+        self.assertEqual(self.post("/api/codes", body, {"X-Forwarded-For": "2001:db8:1:2::77"})[0], 429)
+        self.assertEqual(self.post("/api/codes", body, {"X-Forwarded-For": "2001:db8:1:3::1"})[0], 201)
+        key = self.ask.client_key
+        self.assertEqual(key("::ffff:203.0.113.5"), "203.0.113.5")
+        self.assertEqual(key("[2001:db8::1]"), "2001:db8::/64")
+        self.assertEqual(key("not-an-ip"), "not-an-ip")
+
+    def test_new_codes_have_a_global_limit_and_the_registry_a_cap(self) -> None:
+        self.ask.create_limit_all = self.ask.RateLimit(2, 3600)
+        body = {"owner": digest("x")}
+        for i in range(2):
+            self.assertEqual(self.post("/api/codes", body, {"X-Forwarded-For": f"203.0.113.{i}"})[0], 201)
+        self.assertEqual(self.post("/api/codes", body, {"X-Forwarded-For": "203.0.113.9"})[0], 503)
+        self.ask.create_limit_all = self.ask.RateLimit(100, 3600)
+        with mock.patch.object(self.ask, "MAX_CODES", 2):
+            self.assertEqual(self.post("/api/codes", body, {"X-Forwarded-For": "203.0.113.9"})[0], 503)
+            self.assertEqual(len(self.ask.codes._codes), 2)
+
+    def test_probing_for_codes_is_cut_off(self) -> None:
+        """Past a few unknown codes, nothing but an open meeting answers: no names or times to harvest."""
+        self.ask.miss_limit = self.ask.RateLimit(3, 900)
+        live, waiting = self.new_code("a"), self.new_code("b", "2026-11-20T19:30:00-03:00")
+        self.open_tunnels = {live: 20004}
+        probe = {"X-Forwarded-For": "203.0.113.5"}
+        for n in range(3):
+            self.assertEqual(self.get("/internal/route", {"X-Forwarded-Uri": f"/zzzzz{n + 2}", **probe})[0], 404)
+        self.assertEqual(self.get("/internal/route", {"X-Forwarded-Uri": f"/{waiting}", **probe})[0], 429)
+        status, _, body = self.get("/internal/route", {"X-Forwarded-Uri": "/zzzzzz", **probe})
+        self.assertEqual(status, 429)
+        self.assertIn(b'data-message="toomany"', body)
+        self.assertNotIn(b"2026-11-20", body)
+        # An open meeting still routes (attendees behind the same address keep their meeting) ...
+        self.assertEqual(self.get("/internal/route", {"X-Forwarded-Uri": f"/{live}/ws", **probe})[0], 200)
+        # ... other addresses are unaffected, and known codes never count as misses.
+        other = {"X-Forwarded-For": "198.51.100.7"}
+        for _ in range(10):
+            self.assertEqual(self.get("/internal/route", {"X-Forwarded-Uri": f"/{waiting}", **other})[0], 503)
+
     def test_turn_credentials_for_the_owner_only(self) -> None:
         code = self.new_code("mine")
         status, body = self.post("/api/turn", {"code": code, "secret": "mine"})
