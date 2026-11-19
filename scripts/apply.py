@@ -39,7 +39,7 @@ DISRUPTIVE = frozenset({"frps", "coturn"})
 # Files each service reads at runtime (bind mounts). Changes to them are invisible to compose.
 SERVICE_FILES = {
     "ask": ("ask/ask.py", "ask/landing.html", "ask/Dockerfile"),
-    "frps": ("frps.toml",),
+    "frps": ("frps.toml", "tls/tunnel.crt"),
     "coturn": ("turnserver.conf", "coturn-entrypoint.sh"),
     "caddy": ("Caddyfile", "sites.caddy"),
 }
@@ -206,6 +206,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     env = read_env(env_path)
     problems = check_env(env)
+    if not all((root / "tls" / name).is_file() for name in ("tunnel.crt", "tunnel.key")):
+        problems.append("tls/tunnel.crt or tls/tunnel.key is missing "
+                        "(scripts/tunnel_cert.sh tls <HUB_DOMAIN>; see INSTALL.md)")
     if problems:
         print("error: hub.env is not ready:\n  - " + "\n  - ".join(problems), file=sys.stderr)
         return 2

@@ -58,18 +58,19 @@ cleanup() {
 trap cleanup EXIT
 
 # frpc config for a meeting, rendered from client/frpc.toml.template exactly as Solin would.
-frpc_conf() { # code secret local_port [proxy_name_override]
-    sed -e "s|\${HUB_ADDR}|127.0.0.1|g" -e "s|\${HUB_FRP_PORT}|${FRP_BIND_PORT}|g" \
+frpc_conf() { # code secret local_port [proxy_name_override] [ca_file]
+    sed -e "s|\${TUNNEL_CA}|/etc/frp/ca.crt|g" -e "s|\${HUB_ADDR}|127.0.0.1|g" -e "s|\${HUB_FRP_PORT}|${FRP_BIND_PORT}|g" \
         -e "s|\${FRP_TOKEN}|${FRP_TOKEN}|g" -e "s|\${CODE}|$1|g" -e "s|\${SECRET}|$2|g" \
         -e "s|\${LOCAL_PORT}|$3|g" client/frpc.toml.template > "$WORK/frpc-$1-$3.toml"
     if [ -n "${4:-}" ]; then sed -i "s|^name = \"$1\"|name = \"$4\"|" "$WORK/frpc-$1-$3.toml"; fi
     echo "$WORK/frpc-$1-$3.toml"
 }
-start_frpc() { # container conf
-    docker run -d --name "$1" --network host -v "$2:/etc/frp/frpc.toml:ro" "$FRPC_IMAGE" -c /etc/frp/frpc.toml >/dev/null
+start_frpc() { # container conf [ca_file]: trusts the hub's tunnel certificate unless told otherwise
+    docker run -d --name "$1" --network host -v "$2:/etc/frp/frpc.toml:ro" \
+        -v "${3:-$WORK/tls/tunnel.crt}:/etc/frp/ca.crt:ro" "$FRPC_IMAGE" -c /etc/frp/frpc.toml >/dev/null
 }
 start_meeting() { # name port
-    $PY hall --name "$1" --port "$2" > "$WORK/meeting-$1.log" 2>&1 &
+    $PY meeting --name "$1" --port "$2" > "$WORK/meeting-$1.log" 2>&1 &
     PIDS+=($!)
 }
 api() { # method path [json] -> body in $WORK/api.out, prints the HTTP status
@@ -92,6 +93,11 @@ wait_for() { # seconds description command...
 }
 
 step "Bring up the local hub"
+# The tunnel server's certificate, as on the VPS (frpc below dials 127.0.0.1).
+scripts/tunnel_cert.sh "$WORK/tls" 127.0.0.1 >/dev/null
+scripts/tunnel_cert.sh "$WORK/other-tls" 127.0.0.1 >/dev/null
+chmod 755 "$WORK/tls"   # read by the frps container
+export TUNNEL_TLS_DIR="$WORK/tls"
 "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
 "${COMPOSE[@]}" up -d --build --quiet-pull 2>&1 | grep -vE '^\s*$' | tail -3
 wait_for 30 "ask" bash -c "[ \"\$(curl -s http://127.0.0.1:${ASK_PORT}/healthz)\" = ok ]"
@@ -126,12 +132,12 @@ fi
 
 step "HTTPS through Caddy -> frps -> frpc -> meeting"
 out="$($PY http "$(url "$CODE_A" /join/m1)" "${CA[@]}" --expect 200 2>&1)" \
-    && echo "$out" | grep -q '"hall": "a"' && echo "$out" | grep -q '"x-forwarded-proto": "https"' \
+    && echo "$out" | grep -q '"meeting": "a"' && echo "$out" | grep -q '"x-forwarded-proto": "https"' \
     && pass "GET /$CODE_A/join/m1 reaches meeting a: $out" || fail "GET $CODE_A: $out"
 out="$($PY http "$(url "$CODE_A" /api/lobby)" "${CA[@]}" --post '{"name":"Ana"}' --expect 200 2>&1)" \
     && echo "$out" | grep -q 'Ana' && pass "POST body echoed: $out" || fail "POST: $out"
 out="$($PY http "$(url "$CODE_B")" "${CA[@]}" --expect 200 2>&1)" \
-    && echo "$out" | grep -q '"hall": "b"' && pass "GET /$CODE_B reaches meeting b" || fail "GET $CODE_B: $out"
+    && echo "$out" | grep -q '"meeting": "b"' && pass "GET /$CODE_B reaches meeting b" || fail "GET $CODE_B: $out"
 out="$($PY http "$HUB_URL/internal/route" "${CA[@]}" --expect 404 2>&1)" \
     && pass "internal endpoints not reachable from outside" || fail "internal endpoint exposed: $out"
 
@@ -150,7 +156,23 @@ docker logs smoke-frpc-evil 2>&1 | grep -q "wrong secret" \
 docker logs smoke-frpc-steal 2>&1 | grep -q "must be named '$CODE_C'" \
     && pass "the owner of $CODE_C publishing a tunnel named $CODE_A: refused" || { fail "tunnel theft not refused"; docker logs smoke-frpc-steal 2>&1 | tail -3; }
 out="$($PY http "$(url "$CODE_A" /after-hijack)" "${CA[@]}" --expect 200 2>&1)" \
-    && echo "$out" | grep -q '"hall": "a"' && pass "$CODE_A still served by its meeting" || fail "$CODE_A after hijack: $out"
+    && echo "$out" | grep -q '"meeting": "a"' && pass "$CODE_A still served by its meeting" || fail "$CODE_A after hijack: $out"
+docker rm -f smoke-frpc-evil smoke-frpc-steal >/dev/null
+
+step "The tunnel is TLS with the hub's own certificate"
+start_frpc smoke-frpc-evil "$(frpc_conf "$CODE_C" secret-c 18083)" "$WORK/other-tls/tunnel.crt"
+sed -e 's/^transport.tls.enable = true/transport.tls.enable = false/' "$(frpc_conf "$CODE_C" secret-c 18084)" > "$WORK/frpc-plain.toml"
+start_frpc smoke-frpc-steal "$WORK/frpc-plain.toml"
+sleep 4
+# frpc only says "session shutdown" when the hub's certificate is not the one it trusts.
+logs="$(docker logs smoke-frpc-evil 2>&1)"
+if echo "$logs" | grep -q "connect to server error" && ! echo "$logs" | grep -q "login to server success"; then
+    pass "frpc trusting another certificate does not connect"
+else
+    fail "frpc accepted a certificate it does not trust"; echo "$logs" | tail -3
+fi
+docker logs smoke-frpc-steal 2>&1 | grep -q "start proxy success" \
+    && { fail "frpc without TLS was let in"; docker logs smoke-frpc-steal 2>&1 | tail -3; } || pass "frpc without TLS is refused"
 docker rm -f smoke-frpc-evil smoke-frpc-steal >/dev/null
 
 step "Closed meeting"

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Standard-library test helpers for the Solin hub (used by smoke_local.sh, usable on a real hub).
 
-  hubtest.py hall --port 18081 --name hall-a
-      Dummy hall: a tiny HTTP server (GET -> JSON echo of path + forwarded headers, POST -> echo
+  hubtest.py meeting --port 18081 --name meeting-a
+      Dummy meeting: a tiny HTTP server (GET -> JSON echo of path + forwarded headers, POST -> echo
       of the body) with a WebSocket echo at /ws, like Solin's meeting web server.
   hubtest.py http URL [--cacert CA] [--connect HOST:PORT] [--post DATA] [--expect STATUS]
       One HTTPS request; prints status + body.
@@ -65,8 +65,8 @@ async def ws_read(reader: asyncio.StreamReader) -> tuple[int, bytes]:
     return b0 & 0x0F, data
 
 
-# --------------------------------------------------------------------------- dummy hall
-async def hall_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, name: str) -> None:
+# ------------------------------------------------------------------------ dummy meeting
+async def meeting_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, name: str) -> None:
     try:
         while True:
             line = await reader.readline()
@@ -86,13 +86,13 @@ async def hall_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, 
                 writer.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                              b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n")
                 await writer.drain()
-                print(f"[hall {name}] websocket open", flush=True)
+                print(f"[meeting {name}] websocket open", flush=True)
                 while True:
                     op, data = await ws_read(reader)
                     if op == 8:
                         writer.write(ws_frame(8, data[:2], False))
                         await writer.drain()
-                        print(f"[hall {name}] websocket closed by client", flush=True)
+                        print(f"[meeting {name}] websocket closed by client", flush=True)
                         return
                     if op == 9:
                         writer.write(ws_frame(10, data, False))
@@ -102,9 +102,9 @@ async def hall_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, 
             length = int(headers.get("content-length") or 0)
             body = await reader.readexactly(length) if length else b""
             if method == "POST":
-                out = json.dumps({"hall": name, "echo": body.decode("utf-8", "replace")}).encode()
+                out = json.dumps({"meeting": name, "echo": body.decode("utf-8", "replace")}).encode()
             else:
-                out = json.dumps({"hall": name, "path": target, "host": headers.get("host"),
+                out = json.dumps({"meeting": name, "path": target, "host": headers.get("host"),
                                   "x-forwarded-proto": headers.get("x-forwarded-proto"),
                                   "x-forwarded-host": headers.get("x-forwarded-host"),
                                   "x-forwarded-for": headers.get("x-forwarded-for")}).encode()
@@ -117,9 +117,9 @@ async def hall_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, 
         writer.close()
 
 
-async def run_hall(args: argparse.Namespace) -> int:
-    server = await asyncio.start_server(lambda r, w: hall_conn(r, w, args.name), "127.0.0.1", args.port)
-    print(f"[hall {args.name}] listening on 127.0.0.1:{args.port}", flush=True)
+async def run_meeting(args: argparse.Namespace) -> int:
+    server = await asyncio.start_server(lambda r, w: meeting_conn(r, w, args.name), "127.0.0.1", args.port)
+    print(f"[meeting {args.name}] listening on 127.0.0.1:{args.port}", flush=True)
     async with server:
         await server.serve_forever()
     return 0
@@ -377,9 +377,9 @@ def run_turn(args: argparse.Namespace) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("hall")
+    p = sub.add_parser("meeting")
     p.add_argument("--port", type=int, required=True)
-    p.add_argument("--name", default="hall")
+    p.add_argument("--name", default="meeting")
     for name in ("http", "ws"):
         p = sub.add_parser(name)
         p.add_argument("url")
@@ -406,7 +406,7 @@ def main() -> int:
         if not args.secret and not (args.username and args.password):
             ap.error("turn needs --secret, or --username and --password")
         return run_turn(args)
-    return asyncio.run({"hall": run_hall, "http": run_http, "ws": run_ws}[args.cmd](args))
+    return asyncio.run({"meeting": run_meeting, "http": run_http, "ws": run_ws}[args.cmd](args))
 
 
 if __name__ == "__main__":

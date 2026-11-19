@@ -8,6 +8,7 @@
 #   ${CODE}          the meeting code; the meeting is https://<HUB_DOMAIN>/${CODE}
 #   ${SECRET}        the code's secret (the hub stores only its sha256)
 #   ${LOCAL_PORT}    the port of Solin's meeting web server on this PC (plain HTTP)
+#   ${TUNNEL_CA}     the hub's tunnel certificate (tls/tunnel.crt on the hub; Solin ships it)
 serverAddr = "${HUB_ADDR}"
 serverPort = ${HUB_FRP_PORT}
 auth.method = "token"
@@ -17,6 +18,10 @@ loginFailExit = false
 # Leave `user` unset: frp would prefix the proxy name with it and the hub would refuse the proxy.
 transport.tcpMux = true
 transport.protocol = "tcp"
+# TLS to the hub, accepting only the hub's own certificate (the hub refuses plain connections).
+transport.tls.enable = true
+transport.tls.trustedCaFile = "${TUNNEL_CA}"
+transport.tls.serverName = "${HUB_ADDR}"
 log.to = "console"
 log.level = "info"
 

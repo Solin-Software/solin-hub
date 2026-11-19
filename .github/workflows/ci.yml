@@ -45,6 +45,7 @@ jobs:
         run: |
           sed -e 's/change-me-openssl-rand-hex-32/ci0123456789abcdef0123456789abcdef/' \
               -e 's/^HUB_DOMAIN=.*/HUB_DOMAIN=hub.ci.invalid/' hub.env.example > hub.env
+          scripts/tunnel_cert.sh tls hub.ci.invalid
           python3 scripts/apply.py --dry-run
 
       - name: Validate local configuration

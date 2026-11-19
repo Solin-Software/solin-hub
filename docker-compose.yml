@@ -38,6 +38,8 @@ services:
     command: ["-c", "/etc/frp/frps.toml"]
     volumes:
       - ./frps.toml:/etc/frp/frps.toml:ro
+      # tunnel.crt + tunnel.key (scripts/tunnel_cert.sh); kept on the VPS, never in the repository.
+      - ${TUNNEL_TLS_DIR:-./tls}:/etc/frp/tls:ro
     logging: *logging
 
   ask:

@@ -21,7 +21,7 @@ Public endpoints (served on https://<HUB_DOMAIN>/):
   GET  /healthz             "ok"
   GET  /api/hub             what Solin needs for tunnels: {"frpPort", "frpToken"}
   POST /api/codes           {"owner": "<sha256 hex of a new secret>", "startsAt": "<ISO>" | "",
-                             "title": "<congregation / hall name>", "kind": "midweek" | "weekend" | ...}
+                             "title": "<the congregation's meeting name>", "kind": "midweek" | "weekend" | ...}
                             -> 201 {"code": "k7m4p2"}  (rate-limited per client address)
   POST /api/codes/sync      {"codes": [{"code", "secret", "startsAt", "active", "title", "kind"}]}
                             -> 200 {"rejected": [codes whose secret is wrong or that are unknown]}
@@ -63,8 +63,8 @@ FRP_ADMIN = f"http://127.0.0.1:{os.environ.get('FRP_ADMIN_PORT', '7500')}"
 FRP_AUTH = "Basic " + base64.b64encode(f"admin:{os.environ['FRP_ADMIN_PASSWORD']}".encode()).decode()
 FRP_TOKEN = os.environ.get("FRP_TOKEN", "")
 FRP_BIND_PORT = int(os.environ.get("FRP_BIND_PORT", "7000"))
-PORT_MIN = int(os.environ.get("TUNNEL_PORT_MIN", os.environ.get("HALL_PORT_MIN", "20000")))
-PORT_MAX = int(os.environ.get("TUNNEL_PORT_MAX", os.environ.get("HALL_PORT_MAX", "20999")))
+PORT_MIN = int(os.environ.get("TUNNEL_PORT_MIN", "20000"))
+PORT_MAX = int(os.environ.get("TUNNEL_PORT_MAX", "20999"))
 TURN_SECRET = os.environ.get("TURN_SECRET", "")
 TURN_HOST = os.environ.get("TURN_HOST") or HUB
 TURN_PORT = int(os.environ.get("TURN_PORT", "3478"))

@@ -1,9 +1,9 @@
 # Site routing shared by the production and local Caddyfiles.
 #
 # One address for everything: https://HUB_DOMAIN/
-#   /<code>/...   a meeting: the ask service maps the code to the hall that registered it, and
-#                 Caddy proxies to that hall's frp tunnel -> its Solin meeting web server
-#   anything else the ask service: landing page, hall API, status, health check
+#   /<code>/...   a meeting: the ask service maps the code to the tunnel its owner's Solin opened,
+#                 and Caddy proxies through that frp tunnel -> the Solin meeting web server
+#   anything else the ask service: landing page, Solin's API, status, health check
 {$HUB_DOMAIN} {
 	@internal path /internal/*
 	respond @internal 404
@@ -12,7 +12,7 @@
 	@meeting path_regexp ^/[2-9bcdfghjkmnpqrstvwxyz]+(/.*)?$
 	handle @meeting {
 		# Ask answers unknown, retired and not-yet-open codes itself (that response goes straight
-		# to the visitor); for an open meeting it returns the hall's tunnel port. copy_headers first
+		# to the visitor); for an open meeting it returns the meeting's tunnel port. copy_headers first
 		# deletes any client-supplied X-Solin-Tunnel-Port, so it cannot be spoofed.
 		forward_auth 127.0.0.1:{$ASK_PORT:7400} {
 			uri /internal/route

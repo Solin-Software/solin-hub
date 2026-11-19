@@ -15,6 +15,12 @@ auth.token = "{{ .Envs.FRP_TOKEN }}"
 # tunnel each timeout period (seen in the S5 spike: all attendees reconnected every 90 s).
 transport.tcpMux = true
 
+# TLS only, with the hub's own certificate (scripts/tunnel_cert.sh). Solin pins that certificate,
+# so it hands its tunnel token and a meeting's secret to this hub and nothing else.
+transport.tls.force = true
+transport.tls.certFile = "/etc/frp/tls/tunnel.crt"
+transport.tls.keyFile = "/etc/frp/tls/tunnel.key"
+
 # Admin API, used by the ask service to see which meetings are open (and on which port). Loopback only.
 webServer.addr = "127.0.0.1"
 webServer.port = {{ .Envs.FRP_ADMIN_PORT }}

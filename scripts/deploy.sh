@@ -13,7 +13,7 @@
 #   HUB_REF          git ref to ship (default: HEAD)
 #
 # Only committed files are shipped (git archive), so local edits and secrets never leave this
-# machine. On the VPS, hub.env and .deployed/ are never touched; every other file in
+# machine. On the VPS, hub.env, tls/ and .deployed/ are never touched; every other file in
 # HUB_DIR is replaced by the repository's version, and files deleted from the repository are deleted.
 # The host key is always checked (StrictHostKeyChecking=yes).
 set -euo pipefail
@@ -47,7 +47,7 @@ target="$HUB_SSH_USER@$HUB_HOST"
 echo "== shipping ${commit:0:12} to $target:$HUB_DIR"
 # P = protect from --delete: the hub's own configuration and state live only on the VPS.
 rsync -rlptz --delete \
-    --filter='P /hub.env' --filter='P /.deployed/' \
+    --filter='P /hub.env' --filter='P /tls/' --filter='P /.deployed/' \
     -e "ssh ${ssh_opts[*]}" "$stage/" "$target:$HUB_DIR/"
 
 echo "== applying"
